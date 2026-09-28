@@ -1,85 +1,139 @@
 # EdgeMind ⚡ Offline-first AI memory for electricity line crews
 
-**Code Cubicle 6.0 · Problem Statement 03 · built on Qdrant Edge + Qdrant Server**
+**Code Cubicle 6.0 · Problem Statement 03 · Qdrant Edge on every node ⇄ Qdrant Server**
 
-Line crews at power distribution companies (DISCOMs) fix transformers, feeders and poles in places with little
-or no mobile signal. The knowledge they need (safety procedures, past fixes, what worked last monsoon) lives in
+Line crews at power distribution companies (DISCOMs) fix transformers, feeders and poles where mobile signal
+comes and goes. The knowledge they need (safety procedures, past fixes, what worked last monsoon) lives in
 people's heads, WhatsApp groups and paper registers.
 
-EdgeMind puts a **searchable AI memory on every crew's tablet** using Qdrant Edge. It answers questions with no
-network. When the tablet reconnects, it **decides what the rest of the fleet should know**, syncs it through
-Qdrant Server using **partial snapshots**, and **flags conflicting information** before someone acts on it.
+EdgeMind puts a **searchable AI memory on every crew's edge node** (the van box / tablet) with Qdrant Edge. Crew
+phones talk to their node over local Wi-Fi, so it answers with **no cloud at all**. When the uplink returns it
+**decides what the rest of the fleet should know**, syncs through Qdrant Server, and **flags conflicting
+information** before someone acts on it. Every phone, laptop and the control-room screen update **live**.
 
 ![Dashboard](docs/dashboard.png)
 
-## What makes it different
+## What judges can do in the room
 
-| | What happens | Why it matters |
+| | Try it | What happens |
 |---|---|---|
-| **Qdrant-native edge sync** | Each tablet runs Qdrant's recommended two-shard layout: a mutable shard for its own writes plus a read-only mirror shard per site, restored from a Qdrant Server **snapshot** and refreshed with **partial snapshots** | After 20 new fleet memories a tablet downloads **124 KB instead of 41.8 MB** (0.3%), measured |
-| **Fleet-demand sharing** | When crew B searches and finds nothing, the query goes to the fleet. Crew A's tablet notices that its *private* note answers it and offers "Another crew needs this → Share" | Private knowledge flows only when someone needs it, and only with consent |
-| **Conflicting-facts detection** | Writing "tightened bushing terminals to 50 Nm" flags the SOP that says 40 Nm, offline | Catches wrong numbers before a lineman uses them |
-| **Privacy by policy** | PINs and passwords never leave the tablet; phone numbers and emails reach the fleet only as a redacted copy while the original stays local | Every decision shows its reasons and a score breakdown |
-| **Safety-first queue** | Items mentioning shock, snapped lines, fire or leaks upload first after reconnect | The most urgent knowledge reaches others first |
-| **Honest conflict handling** | Server-side compare-and-set; two crews editing the same memory offline get *keep mine / keep theirs / merge*; readings use newest-wins; delete vs edit keeps the edit | No silent overwrites |
-| **Offline answers** | "Ask" answers from the tablet's own memory with citations, using a local LLM (Ollama) or, without one, an extractive answer | Works in a basement with no signal |
-
-## Measured
-
-Real Qdrant Server 1.19.1 and qdrant-edge-py 0.8, laptop CPU. Reproduce with `python tools/bench.py`.
-
-| Measure | 5,000 memories | 20,000 memories |
-|---|---|---|
-| Hybrid search on the tablet, p50 / p95 (excluding query embedding) | 0.56 / 0.69 ms | 1.22 / 1.64 ms |
-| Full snapshot (first sync of a site) | 10.9 MB | 41.8 MB |
-| Partial snapshot after 20 new memories | 120 KB (1.1%) | 124 KB (0.3%) |
-| Applying the partial snapshot on the tablet | 215 ms | 228 ms |
-
-**Engineering note.** With default server settings, a partial snapshot after 20 changes was **50%** of the full
-shard, because new points land in one large unindexed segment and the whole segment ships. EdgeMind configures
-the server collection (`indexing_threshold=500 KB`, `default_segment_number=8`) so bulk data sits in sealed,
-indexed segments and new writes go to a small one. That took it from 50% to 0.3%.
+| **Join from your phone** | Scan the QR on the big screen, pick a crew | You get that crew's field app. Ask, add, review; the big screen updates as you tap |
+| **Live fleet** | Add a fix on crew A | It is searchable on crew B's node in **~0.3 s** (measured and shown on screen), with no manual sync |
+| **Kill the signal** | Flip a node's *Uplink* off (or pull the Wi-Fi on a laptop node) | Ask still answers in milliseconds from the node's own Qdrant Edge shards; writes queue, safety items first |
+| **Kill the cloud** | *Stop cloud* really terminates Qdrant Server and the gateway | Every node keeps working; queues drain in priority order on *Start cloud* |
+| **Fleet demand** | Crew B asks something it can't answer → *Ask the fleet* | Within ~0.3 s crew A's phone pops **★ Another crew needs this**: its *private* note. One tap shares it |
+| **Conflicting facts** | Write "tightened bushing terminals to 50 Nm" | Flagged instantly against the SOP that says 40 Nm, offline |
+| **Privacy** | Write a note with a phone number / PIN | PINs never leave the node; PII goes to the fleet redacted; the original stays local |
+| **Elastic fleet** | *+ Edge node*, or run one command on a second laptop | A new node enrolls with the join code, bootstraps from a snapshot and goes live on the map |
+| **Ask in Hindi or Marathi** | "लाइन पर काम शुरू करने से पहले क्या करना चाहिए?" | Cross-lingual retrieval finds the English permit-to-work SOP in ~20 ms; the on-node AI answers in plain English with a citation |
+| **AI that admits it doesn't know** | Ask something no crew has written down | The local LLM says *not in this node's memory* and highlights *Ask the fleet*, instead of inventing an answer |
+| **Photo evidence** | 📷 a burnt bushing, or a photo on another screen | CLIP runs on the node; the photo is searchable by words ("burnt bushing") and by photo ("seen this before?"), offline. A thumbnail and its vector reach the fleet live; the full photo stays on the node |
+| **Why did this rank?** | Search in the Memory tab | Every result shows its meaning / keyword / photo score and the fused score; filter chips show native Qdrant facet counts |
+| **How did this memory evolve?** | 🕘 history on any memory | Every version the node has seen: created, edited here, received from crew B, merged, deleted |
+| **Scale** | ⚡ 20k scale test on a node | Builds a 20,000-memory Qdrant Edge shard on the spot and times the real hybrid pipeline: **~2.4 ms p50** |
 
 ## Architecture
 
 ```
-  Tablet A (process :8001)                  Cloud                              Tablet B (process :8002)
- ┌──────────────────────────┐    ┌───────────────────────────────┐    ┌──────────────────────────┐
- │ local shard  (mutable)   │    │ Sync gateway :8100            │    │ local shard  (mutable)   │
- │ mirror: pune   (snapshot)│◄──►│  · compare-and-set on version │◄──►│ mirror: nagpur (snapshot)│
- │ mirror: global (snapshot)│    │  · server-side sequence nos.  │    │ mirror: global (snapshot)│
- │ outbox · review · policy │    │  · device tokens              │    │ outbox · review · policy │
- │ Ask (Ollama / extractive)│    │  · fleet demand · snapshot    │    │ Ask (Ollama / extractive)│
- └──────────────────────────┘    │    proxy                      │    └──────────────────────────┘
-                                 │ Qdrant Server :6333           │
-                                 │  one collection per site      │
-                                 └───────────────────────────────┘
-        Dashboard :8000 = launcher that starts/stops every process ("Stop cloud" really kills the server)
+ Crew phones (any browser)          Hub laptop / cloud VM                               Another laptop (optional)
+ ┌───────────────┐   Wi-Fi   ┌──────────────────────────────────────────────┐   LAN    ┌──────────────────────────┐
+ │ field app  /m │◄─────────►│ Console :8000  dashboard · field app · proxy │◄────────►│ edge node (launch.py join)│
+ └───────────────┘   SSE     │   └ live aggregator (SSE fan-out)            │   SSE    │  own Qdrant Edge shards   │
+                             │ Gateway :8100  enroll · tokens · site ACL    │◄────────►│  field app for its crew   │
+                             │   compare-and-set · seq nos · fleet demand   │          └──────────────────────────┘
+                             │   live push channel · snapshot proxy (gzip)  │
+                             │ Qdrant Server :6333 (loopback only)          │
+                             │ Edge nodes tablet-A, tablet-B, … (processes) │
+                             │   each: mutable shard + mirror shard per site │
+                             └──────────────────────────────────────────────┘
 ```
 
-**One sync cycle** (every 4 s while online, and immediately on reconnect):
+**One node** = a mutable Qdrant Edge shard for its own writes + a read-only **mirror shard per subscribed site**
+(Qdrant's recommended edge layout), an outbox, review queues and a sync policy. Search runs fully offline across all shards:
 
-1. **hello**: heartbeat, report failed searches, receive fleet demand and each site's head sequence number
-2. **push**: outbox in priority order through compare-and-set
-3. **pull**: for each subscribed site whose head moved, a partial snapshot (full snapshot the first time) goes into the mirror shard via `snapshot_manifest()` and `update_from_snapshot()`
-4. **settle**: purge local copies the mirror now holds (Qdrant's dual-write pattern), check new fleet memories for contradictions, re-run the policy on private notes against fleet demand
+```
+ meaning  (multilingual MiniLM, 384-d dense)  ┐
+ keywords (Qdrant Edge built-in BM25)         ├─ RRF fusion ─ recency Formula (exp decay) ─ results + "why"
+ photos   (CLIP text→image, 512-d "image")    ┘        └─ or MMR diversity for the AI's sources
+```
+
+Candidates come from each shard's native Qdrant query; the final order is RRF over each retriever's rank
+across *all* shards (a shard's own RRF scores aren't comparable between a 3-memory local shard and a
+5,000-memory mirror). Payload indexes on `kind`, `site`, `status`, `photo`, `updated_at` drive filters and
+facet counts.
+
+**Answers**: an instant answer extracted by meaning (tens of ms), then a local LLM (Ollama,
+`qwen2.5:1.5b`) streams a grounded, cited answer, or says the notes don't cover it.
+
+**One sync cycle** (triggered live by the gateway, a local write, or a 15 s fallback timer):
+1. **hello**: heartbeat, report failed searches, receive fleet demand, site heads, cloud epoch
+2. **push**: outbox in priority order through server-side compare-and-set
+3. **pull**, adaptive transport per site:
+   - no mirror yet → **full snapshot** restored into a Qdrant Edge shard
+   - a few changes → **point delta** upserted into the mirror (a few KB, sub-second)
+   - many changes, or every few minutes after deltas → **partial snapshot** (`snapshot_manifest()` →
+     only the changed segments → `update_from_snapshot()`), which reconciles the mirror *exactly* with the server
+4. **settle**: purge local copies the mirror now holds (dual-write pattern), scan new fleet memories for
+   contradictions, re-run the policy on private notes against fleet demand
+
+**Live everywhere.** Each node holds an event stream to the gateway; any write on a site it follows starts its
+sync within ~200 ms. The open stream is also the node's presence. Each node streams its own state to phones and
+the hub, and the hub fans everything out to every dashboard. No polling loops.
+
+## Measured (this laptop: Windows 11, Qdrant Server 1.19.1, qdrant-edge-py 0.8)
+
+| Measure | Value |
+|---|---|
+| Write on node A → searchable on node B (live, no manual sync) | **0.2–0.5 s** |
+| Fleet demand → private note suggested on another crew's node | **~0.3 s** |
+| Full snapshot to bootstrap a site mirror, on the wire | **~29 KB** (shard files are ~180 MB on disk on Windows) |
+| Point delta for 1 new memory | ~5.5 KB |
+| Offline Ask: instant answer (hybrid search + semantic sentence extraction) | ~20–50 ms |
+| Offline Ask: local LLM (qwen2.5:1.5b, CPU) first words / full answer | ~1.4 s / ~2–3 s (warm) |
+| Hindi / Marathi → English SOP retrieval, demo questions | 11 / 11 correct (English-only model: 5 / 11) |
+| Hybrid search on a 20,000-memory Qdrant Edge shard (HNSW) | **2.2–2.4 ms p50 · 3.5 ms p95** |
+| Photo captured on node A → thumbnail + CLIP vector on node B | ~2 s |
+
+Reproduce: `python tests/test_e2e.py` prints live propagation; `python tools/bench.py --n 5000` (with a Qdrant
+Server running) prints search latency and snapshot sizes at scale.
+
+### Engineering notes (things we found and fixed)
+
+- **Windows snapshots were 873 MB for 4 documents.** Qdrant preallocates 32 MB pages per appendable segment
+  file, and NTFS has no sparse files, so they land in the snapshot tar as zeros. With 8 segments the first sync
+  timed out. Fix: 2 segments, a 1 MB WAL, and a gzip stream. Qdrant's own gzip leaves long repetitive runs, so
+  one more gzip pass over its small output cuts the wire size ~25× for almost no CPU: **873 MB → 29 KB**.
+- **Partial snapshots cost 1.5–4.5 s to apply on Windows**: too slow for "live". Hence the adaptive transport:
+  point deltas for liveness, partial snapshots for exact reconciliation. We verified that a partial snapshot
+  applied on top of point-synced segments reconciles to exactly the server's state, including server-side deletes.
+- **Children outliving the hub**: on Windows, killing the launcher left Qdrant and every node running. Now every
+  child is in a Job Object (KILL_ON_JOB_CLOSE) and Python children also watch the hub's PID.
+- **Deleted memories could come back in search.** `qdrant-edge-py` 0.8 never matches `MatchValue(True)` on a
+  boolean payload, so the "not deleted" filter was silently a no-op. Every write now also stores keyword flags
+  (`status`, `photo`) and all edge filters use those; a regression test covers it.
+- **Cross-shard ranking.** RRF is rank-based, so fusing per shard let the top of a 3-memory local shard tie with
+  the true best match in the fleet mirror. Final ranking now fuses each retriever's global rank across shards.
+- **RAM.** Three model families on a 16 GB laptop: the gateway loads the text model only to seed and then
+  releases it, photo models load on first use and unload after 2 idle minutes, Ollama keeps its model 10 minutes.
+- **Tiny LLMs write bad Hindi.** Both 1–1.5B models we tested produced broken Hindi/Marathi, so retrieval is
+  multilingual and the AI answers in plain English from the English SOPs. Honest beats impressive-but-wrong.
 
 ## How it maps to PS03
 
 | PS03 goal | EdgeMind |
 |---|---|
-| Searchable semantic memory on the edge device | Qdrant Edge shards on disk per tablet (1 mutable + 1 mirror per site), dense + BM25 hybrid |
-| Low-latency vector and hybrid search without network | RRF fusion of dense (FastEmbed, local ONNX) and Qdrant Edge's built-in BM25; ~1 ms at 20k memories |
-| Dynamically decide what stays local vs syncs | Hard rules (credentials, private, PII → redacted) + adaptive share score (team value, **fleet demand**, local use) |
-| Intermittent connectivity, keep operating offline | Everything runs on the tablet; outbox with safety-first priority; real server kill in the demo |
-| Sync edge ⇄ Qdrant Server when connectivity returns | Full + **partial snapshots** into mirror shards; point sync fallback without a server |
-| Evolving memory, updates, conflicting information | Versioned compare-and-set, 3-way conflict resolution, near-duplicate linking, **contradicting-value detection** |
-| UI to inspect memory, search, sync status, activity | Two tablets + cloud side by side, review queue, sync queue, live metrics, activity log |
-| A meaningful edge-to-cloud AI workflow | Fleet demand → private note suggested → shared → another crew receives it, with no central operator |
+| Searchable semantic memory on the edge device | Qdrant Edge shards on each node's disk (1 mutable + 1 mirror per site), dense + BM25 hybrid |
+| Low-latency vector and hybrid search without network | RRF fusion on-device; the field app shows the latency of every search |
+| Dynamically decide what stays local vs syncs | Hard rules (credentials, private, PII → redacted) + adaptive share score (team value, **live fleet demand**, local use), explained per memory |
+| Intermittent connectivity, keep operating offline | Uplink switch per node, real Wi-Fi off on laptop nodes, real server kill; priority outbox |
+| Sync edge ⇄ Qdrant Server when connectivity returns | Full / partial snapshots + point deltas, chosen per site; server sequence numbers; epoch-based rehydration |
+| Evolving memory, updates, conflicting information | Versioned compare-and-set, keep mine / theirs / merge, near-duplicate linking, **contradicting-value detection** |
+| UI to inspect memory, search, sync status, activity | Control-room dashboard with a live fleet map + a phone field app per crew |
+| A meaningful edge-to-cloud AI workflow | Failed search on one node → fleet demand → another node's private note suggested → shared → received live |
 
 ## Run it
 
-Needs **Python 3.10–3.12** (tick "Add python.exe to PATH" on Windows).
+Needs **Python 3.10–3.13** and ~4 GB free RAM for the full demo (tick "Add python.exe to PATH" on Windows).
 
 ```powershell
 # Windows (PowerShell, inside the edgemind folder)
@@ -90,65 +144,102 @@ Needs **Python 3.10–3.12** (tick "Add python.exe to PATH" on Windows).
 ./run.sh
 ```
 
-The first run installs packages, downloads **Qdrant Server** (~30 MB, from GitHub releases) and the **embedding
-model** (~70 MB), which takes a few minutes. The dashboard then opens at **http://127.0.0.1:8000**. Ctrl+C stops everything.
+The first run installs packages, downloads **Qdrant Server** (~30 MB) and the **embedding model** (~70 MB).
+The terminal then prints:
 
-- Already have Qdrant running (Docker or Qdrant Cloud)? `set QDRANT_URL=http://localhost:6333` before `run.bat`.
-- No internet for the server download? It falls back to an embedded Qdrant with point sync; every feature except snapshots still works.
+```
+  EdgeMind hub is live
+  Dashboard (this laptop): http://127.0.0.1:8000
+  Dashboard (any device):  http://192.168.x.x:8000
+  Crew phones:             http://192.168.x.x:8000/m      (+ a QR code)
+  Operator PIN:            ######
+  Fleet join code:         EM-####
+```
 
-### Optional: real local LLM for answers
+**Windows asks once whether Python may use the network: tick Private networks → Allow.** Otherwise phones and
+other laptops can't reach the hub. If port 8000 is taken, the hub picks the next free port and says so.
 
-Install [Ollama](https://ollama.com), then `ollama pull llama3.2:1b`. EdgeMind detects it automatically; answers
-then show "local LLM · llama3.2:1b". Without it, answers are extractive (the best matching sentences, cited).
+### Phones
 
-## 2-minute demo script
+Same Wi-Fi as the hub (or connect the laptop and phones to one phone hotspot, which is the most reliable at a venue:
+venue Wi-Fi often blocks device-to-device traffic). Open the *Crew phones* URL or scan the QR from **📱 Join from
+a phone** on the dashboard.
 
-1. **(15 s) The problem.** "Line crews work where there's no signal. Their knowledge is in heads and WhatsApp. EdgeMind puts it on the tablet."
-2. **(25 s) Offline.** Switch crew A **Offline**. Ask *"what must I do before working on a line?"*: a cited answer in milliseconds. Add a fix; it shows ⏳ queued.
-3. **(20 s) Privacy.** In Memory, the shift note is 🔒 device-only, and the T-417 fix is ✂ synced redacted (the cloud column shows `[EMAIL]` / `[PHONE]`). Crew B's store-room PIN never left.
-4. **(25 s) Fleet demand.** Switch crew A back **Online** (its queued fix uploads, safety items first). On crew B ask *"transformer drain valve leaking, no spare valve"*, then click **Ask the fleet**. Within a few seconds crew A's Review shows **★ Another crew needs this**: its private "Drain valve leak trick". Click **Share**; it appears on crew B.
-5. **(20 s) Conflicting facts.** On crew B add a fix *"Tightened HV bushing terminals on T-88 to 50 Nm"*. Review shows **50 Nm vs 40 Nm** against the SOP.
-6. **(15 s) Real outage.** Click **Stop cloud** (really kills Qdrant + gateway). Crews keep working; queue grows. **Start cloud**: queue drains, partial snapshot size shows in the top bar.
-7. **(20 s) Numbers.** "Partial snapshot: 124 KB instead of 41.8 MB. Search: 1 ms at 20,000 memories. Every decision explained."
+### Another laptop as a real edge node
 
-Conflict demo (if asked): put both tablets offline, edit *Permit-to-work* differently on each, bring A then B online, then **Merge both** on B.
+Copy the folder, then (the dashboard's Join dialog shows this exact line with the hub's address and code):
+
+```powershell
+.\run.bat join --hub http://192.168.x.x:8100 --code EM-#### --name "Line crew C" --sites pune,global
+```
+
+It keeps its own shards on its own disk, serves the field app to its own crew at `http://<its-ip>:8001`, and
+appears on the hub's map. Turn its Wi-Fi off: it keeps answering. Turn it back on: it catches up in seconds.
+
+### Local LLM for answers (recommended)
+
+Install [Ollama](https://ollama.com) (`winget install Ollama.Ollama`) and run `ollama pull qwen2.5:1.5b` (~1 GB).
+Nodes detect it and stream an AI answer under the instant one. Without it, everything works; answers are the
+instant extracted ones. The first run also downloads the multilingual text model and the CLIP photo models
+(~700 MB in total, once).
+
+## Security model
+
+| Threat | Control |
+|---|---|
+| Random device writes to the fleet | Nodes enroll with the fleet join code and get their own random token (stored hashed on the gateway; revocable from the dashboard) |
+| A Pune crew reads Nagpur data | Site ACL on every gateway read and write: a node only touches the sites it enrolled for |
+| Someone on the Wi-Fi reads the cloud | Every gateway read API needs the admin token; Qdrant Server listens on loopback only |
+| Someone on the Wi-Fi wipes the demo | Reset / Stop cloud / add or remove nodes need the operator PIN (except from the hub laptop itself) |
+| Credentials leak into the cloud | Policy: passwords / PINs / OTPs never leave the node; phone numbers, emails, ID numbers only as a redacted copy |
+| Oversized or malformed input | Length limits and schema validation on every API |
+
+Known gaps (honest): traffic is plain HTTP on the LAN (put the hub behind TLS for a real deployment); shards are
+not encrypted at rest; the join code is shared by the fleet.
 
 ## Tests
 
 ```bash
-python tests/test_e2e.py                          # real processes + real Qdrant Server
+python tests/test_e2e.py                          # real processes + real Qdrant Server (~5 min)
 EDGEMIND_QDRANT=embedded python tests/test_e2e.py # no server (point sync)
-python tools/bench.py --n 20000                   # latency + snapshot sizes (needs a running Qdrant Server)
+python tools/bench.py --n 20000                   # needs a running Qdrant Server
 ```
 
-The end-to-end test drives the full story over HTTP: subscriptions, redaction, offline write + search, partial
-snapshot pull, conflict → merge, contradiction, fleet demand → share, offline answer, real server kill → queue →
-drain, and delete propagation. **Run it once on your laptop**: it also confirms the thresholds work with the real
-embedding model.
+The end-to-end test drives everything over HTTP through the hub, like the phones do:
+1. enrollment, subscriptions, redaction
+2. **security** (admin-only reads, site isolation, wrong join code)
+3. offline write + search, reconnect
+4. conflict → merge, and the **memory history** of that merge
+5. contradiction
+6. fleet demand → share
+7. offline answer; **Hindi + Marathi** retrieval; **local LLM**: grounded answer, uses the note another crew
+   shared, says "not in memory" when nobody knows
+8. real server kill → queue → drain
+9. delete, and deleted memories never resurface in search
+10. **live propagation with no manual sync**; **photos** (text→photo, photo→photo); **scale test**
+11. **adding a node from the console**
+12. **a separate `launch.py join` process** that joins over HTTP, bootstraps and writes live
+13. **hub reset** → that remote node rehydrates the fleet with its own memories
 
 ## Project layout
 
 ```
-launch.py            start everything (dashboard + supervisor)
-app/console.py       launcher: Qdrant Server, gateway, tablets as separate processes; dashboard API
-app/gateway.py       cloud sync gateway: compare-and-set, sequence numbers, snapshot proxy, fleet demand
-app/cloudstore.py    Qdrant Server collections (one per site), tuned for small partial snapshots
-app/device.py        a tablet: mutable + mirror Qdrant Edge shards, hybrid search, review queues, metrics
-app/sync_client.py   hello → push → pull (full/partial snapshot or points) → settle
-app/device_api.py    a tablet's HTTP API (runs offline)
+launch.py            hub (default) or `join` (this machine becomes an edge node)
+app/console.py       hub: supervisor, dashboard, field-app host, proxies, live SSE aggregator, operator PIN
+app/gateway.py       cloud sync gateway: enrollment, tokens, site ACL, compare-and-set, live push, snapshots
+app/cloudstore.py    Qdrant Server collections (one per site), tuned for small snapshots; gzip snapshot stream
+app/device.py        an edge node: mutable + mirror Qdrant Edge shards, hybrid search, review queues, rehydrate
+app/sync_client.py   hello → push → adaptive pull (full / partial snapshot / point delta) → settle; live listener
+app/device_api.py    a node's HTTP API + SSE events + field app (runs with no uplink)
+app/edge_node.py     `launch.py join`
+app/lifeline.py      children die with the hub (Windows Job Object + parent watch)
 app/policy.py        what stays local, redaction, share score, priority
 app/facts.py         conflicting-value detection
-app/answer.py        offline answers: Ollama or extractive, with citations
-app/qdrant_bin.py    downloads the Qdrant Server binary for your OS
+app/answer.py        offline answers: Ollama, or semantic sentence extraction with citations
 app/seed.py          demo data: DISCOM line crews, Pune and Nagpur circles
-static/              dashboard (plain HTML/CSS/JS)
-tests/test_e2e.py    end-to-end story test
+static/              dashboard (index.html, app.js) and phone field app (field.html, field.js); no build step
+tests/test_e2e.py    end-to-end system test
 tools/bench.py       benchmark
 ```
-
-## Known limits (honest)
-
-- Tablets are separate processes on one laptop, not physical devices yet. The next step is the same device code on a Raspberry Pi or Android phone (Qdrant Edge has a React Native package).
-- Contradiction detection compares numbers with units across similar memories; it does not understand free-text disagreements.
-- Device tokens are static demo secrets; local shards are not encrypted at rest.
-- If the embedding model cannot be downloaded, all processes fall back to a hashing embedder (search still works, less semantically).
+#   E d g e M i n d  
+ 
