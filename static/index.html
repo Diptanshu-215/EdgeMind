@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EdgeMind · Offline-first memory for line crews</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%227%22 fill=%22%23d6481f%22/%3E%3Cpath d=%22M17 5 9 18h6l-1 9 8-13h-6z%22 fill=%22white%22/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">⚡</div>
+      <div>
+        <h1>EdgeMind</h1>
+        <p class="sub">Offline-first AI memory for electricity line crews · Qdrant Edge on every tablet ⇄ Qdrant Server</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span class="chip mono" id="proc-qdrant">qdrant</span>
+      <span class="chip mono" id="proc-gateway">gateway</span>
+      <button class="btn danger-outline" id="cloud-toggle">Stop cloud</button>
+      <button class="btn ghost" id="reset">Reset demo</button>
+    </div>
+  </header>
+
+  <div id="boot" class="boot hidden"><div class="spinner"></div><span id="boot-msg">Starting…</span></div>
+
+  <section class="metrics" id="metrics" aria-label="Live measurements">
+    <div class="tile"><b id="m-search">–</b><span>on-device search p50 · p95</span></div>
+    <div class="tile"><b id="m-sync">–</b><span id="m-sync-label">last mirror refresh</span></div>
+    <div class="tile"><b id="m-private">–</b><span>of crew A's own memories kept on device</span></div>
+    <div class="tile"><b id="m-cloud">–</b><span>fleet memories in Qdrant Server</span></div>
+    <div class="tile"><b id="m-queue">–</b><span>changes waiting to upload</span></div>
+  </section>
+
+  <main class="grid">
+    <section class="device" id="dev-tablet-A" style="--dev: var(--a)"></section>
+
+    <section class="cloud panel" id="cloud">
+      <div class="panel-head">
+        <div>
+          <h2>☁ Cloud · Qdrant Server</h2>
+          <p class="muted small" id="cloud-mode">…</p>
+        </div>
+        <span class="pill" id="cloud-pill">…</span>
+      </div>
+      <div class="flow" aria-hidden="true">
+        <span id="flow-A" class="flow-line"></span>
+        <span class="flow-core">sync gateway</span>
+        <span id="flow-B" class="flow-line"></span>
+      </div>
+      <div class="heads" id="heads"></div>
+      <div id="demand-box" class="demand hidden">
+        <h3>Crews are looking for</h3>
+        <ul class="list compact" id="demand"></ul>
+      </div>
+      <h3>Fleet knowledge <span class="count" id="cloud-count"></span></h3>
+      <ul class="list cloud-list" id="cloud-list"></ul>
+      <h3>Activity</h3>
+      <ul class="log" id="log"></ul>
+    </section>
+
+    <section class="device" id="dev-tablet-B" style="--dev: var(--b)"></section>
+  </main>
+
+  <template id="device-tpl">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h2 class="dev-name"></h2>
+          <p class="muted small dev-sites"></p>
+        </div>
+        <label class="switch big" title="Cut this tablet's network">
+          <input type="checkbox" class="online" />
+          <span class="track"></span><span class="net-label">Online</span>
+        </label>
+      </div>
+      <div class="status-row">
+        <span class="pill conn"></span>
+        <span class="muted small last-sync"></span>
+        <span class="spacer"></span>
+        <button class="btn small sync-now">Sync now</button>
+      </div>
+      <div class="stats">
+        <div><b class="s-mem">0</b><span>memories</span></div>
+        <div><b class="s-queue">0</b><span>queued ↑</span></div>
+        <div><b class="s-local">0</b><span>device-only</span></div>
+        <div class="s-review-box"><b class="s-review">0</b><span>to review</span></div>
+      </div>
+
+      <form class="ask row">
+        <input class="q" placeholder="Ask your memory, e.g. what before working on a line?" autocomplete="off" />
+        <button class="btn primary">Ask</button>
+      </form>
+      <div class="answer hidden"></div>
+
+      <nav class="tabs" role="tablist">
+        <button data-tab="memory" class="active">Memory</button>
+        <button data-tab="add">Add</button>
+        <button data-tab="review">Review <span class="badge review-badge"></span></button>
+        <button data-tab="queue">Queue</button>
+      </nav>
+      <div class="tab" data-pane="memory">
+        <div class="filters">
+          <button class="fchip active" data-f="all">All</button>
+          <button class="fchip" data-f="own">This device</button>
+          <button class="fchip" data-f="fleet">Fleet mirror</button>
+        </div>
+        <ul class="list memory"></ul>
+      </div>
+      <div class="tab hidden" data-pane="add">
+        <form class="add-form">
+          <input type="hidden" class="f-id" />
+          <input class="f-title" placeholder="Title" />
+          <textarea class="f-text" rows="4" placeholder="What did you find or fix? Saved on the tablet instantly, even offline."></textarea>
+          <div class="row">
+            <label>Kind <select class="f-kind"></select></label>
+            <label>Site <select class="f-site"></select></label>
+            <label>Share
+              <select class="f-vis">
+                <option value="auto">auto (policy)</option>
+                <option value="shared">shared</option>
+                <option value="private">private</option>
+              </select>
+            </label>
+          </div>
+          <div class="policy-preview"></div>
+          <div class="row">
+            <button class="btn primary save">Save on tablet</button>
+            <button type="button" class="btn ghost cancel hidden">Cancel edit</button>
+          </div>
+        </form>
+      </div>
+      <div class="tab hidden" data-pane="review"><div class="review"></div></div>
+      <div class="tab hidden" data-pane="queue">
+        <p class="muted small">Uploaded in priority order when the network returns: safety first.</p>
+        <ol class="list queue"></ol>
+      </div>
+      <div class="down hidden">Tablet process not running.</div>
+    </div>
+  </template>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
