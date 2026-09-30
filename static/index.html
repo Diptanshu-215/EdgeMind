@@ -3,147 +3,307 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>EdgeMind · Offline-first memory for line crews</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%227%22 fill=%22%23d6481f%22/%3E%3Cpath d=%22M17 5 9 18h6l-1 9 8-13h-6z%22 fill=%22white%22/%3E%3C/svg%3E" />
+  <title>EdgeMind · Fleet</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%233b82f6%22/%3E%3Crect x=%229%22 y=%229%22 width=%2214%22 height=%2214%22 rx=%223%22 fill=%22none%22 stroke=%22white%22 stroke-width=%222.5%22/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header class="topbar">
+<div class="shell">
+
+  <!-- ============================================================ sidebar -->
+  <aside class="sidebar" id="app-sidebar">
     <div class="brand">
-      <div class="logo" aria-hidden="true">⚡</div>
-      <div>
-        <h1>EdgeMind</h1>
-        <p class="sub">Offline-first AI memory for electricity line crews · Qdrant Edge on every tablet ⇄ Qdrant Server</p>
-      </div>
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">EdgeMind</span>
     </div>
-    <div class="top-actions">
-      <span class="chip mono" id="proc-qdrant">qdrant</span>
-      <span class="chip mono" id="proc-gateway">gateway</span>
-      <button class="btn danger-outline" id="cloud-toggle">Stop cloud</button>
-      <button class="btn ghost" id="reset">Reset demo</button>
+
+    <nav class="nav" aria-label="Views">
+      <a href="#/overview" class="sidebar-nav-item" data-view="overview"><span class="nav-ico" data-icon="home"></span>Overview</a>
+      <a href="#/crews" class="sidebar-nav-item" data-view="crews"><span class="nav-ico" data-icon="users"></span>Crews<span class="nav-count" id="nav-nodes-count"></span></a>
+      <a href="#/review" class="sidebar-nav-item" data-view="review"><span class="nav-ico" data-icon="checkList"></span>Review<span class="nav-badge" id="nav-review-badge" hidden></span></a>
+      <a href="#/memory" class="sidebar-nav-item" data-view="memory"><span class="nav-ico" data-icon="database"></span>Fleet memory</a>
+      <a href="#/activity" class="sidebar-nav-item" data-view="activity"><span class="nav-ico" data-icon="activity"></span>Activity</a>
+      <a href="#/network" class="sidebar-nav-item" data-view="network"><span class="nav-ico" data-icon="map"></span>Network</a>
+    </nav>
+
+    <div class="side-section">
+      <div class="side-heading">Crews</div>
+      <ul class="side-crews" id="side-crews"></ul>
     </div>
-  </header>
 
-  <div id="boot" class="boot hidden"><div class="spinner"></div><span id="boot-msg">Starting…</span></div>
-
-  <section class="metrics" id="metrics" aria-label="Live measurements">
-    <div class="tile"><b id="m-search">–</b><span>on-device search p50 · p95</span></div>
-    <div class="tile"><b id="m-sync">–</b><span id="m-sync-label">last mirror refresh</span></div>
-    <div class="tile"><b id="m-private">–</b><span>of crew A's own memories kept on device</span></div>
-    <div class="tile"><b id="m-cloud">–</b><span>fleet memories in Qdrant Server</span></div>
-    <div class="tile"><b id="m-queue">–</b><span>changes waiting to upload</span></div>
-  </section>
-
-  <main class="grid">
-    <section class="device" id="dev-tablet-A" style="--dev: var(--a)"></section>
-
-    <section class="cloud panel" id="cloud">
-      <div class="panel-head">
-        <div>
-          <h2>☁ Cloud · Qdrant Server</h2>
-          <p class="muted small" id="cloud-mode">…</p>
+    <div class="side-foot">
+      <div class="side-card">
+        <div class="side-card-row">
+          <span class="side-card-title">Cloud</span>
+          <span class="status-dot" id="side-cloud-dot"></span>
         </div>
-        <span class="pill" id="cloud-pill">…</span>
+        <div class="side-card-procs">
+          <span class="chip" id="proc-qdrant">Qdrant</span>
+          <span class="chip" id="proc-gateway">Gateway</span>
+        </div>
+        <button class="btn small block" id="cloud-toggle" data-op>Stop cloud</button>
       </div>
-      <div class="flow" aria-hidden="true">
-        <span id="flow-A" class="flow-line"></span>
-        <span class="flow-core">sync gateway</span>
-        <span id="flow-B" class="flow-line"></span>
+      <div class="side-op">
+        <span id="side-op-status">Read-only</span>
+        <button type="button" class="link" id="side-op-btn">Unlock</button>
       </div>
-      <div class="heads" id="heads"></div>
-      <div id="demand-box" class="demand hidden">
-        <h3>Crews are looking for</h3>
-        <ul class="list compact" id="demand"></ul>
-      </div>
-      <h3>Fleet knowledge <span class="count" id="cloud-count"></span></h3>
-      <ul class="list cloud-list" id="cloud-list"></ul>
-      <h3>Activity</h3>
-      <ul class="log" id="log"></ul>
-    </section>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
 
-    <section class="device" id="dev-tablet-B" style="--dev: var(--b)"></section>
-  </main>
+  <!-- ============================================================ main -->
+  <div class="main-col">
+    <header class="page-head">
+      <button class="icon-btn menu-btn" id="sidebar-toggle" aria-label="Menu"><span data-icon="menu"></span></button>
+      <div class="page-titles">
+        <h1 id="page-title">Fleet overview</h1>
+        <p class="page-sub"><span id="page-sub">Loading…</span> <span class="live-chip" id="live-chip"><span class="live-dot"></span><span>Connecting</span></span></p>
+      </div>
+      <div class="search">
+        <span class="search-ico" data-icon="search"></span>
+        <input id="global-search" type="search" placeholder="Search memories" autocomplete="off" />
+        <kbd>Ctrl K</kbd>
+      </div>
+      <div class="head-actions">
+        <button class="btn" id="add-node-btn" data-op><span data-icon="plus"></span>Add crew</button>
+        <button class="btn primary" id="join-btn"><span data-icon="phone"></span>Connect a phone</button>
+        <button class="icon-btn" id="reset" data-op title="Reset demo data"><span data-icon="sync"></span></button>
+        <button class="icon-btn" id="op-badge" title="Operator access"><span data-icon="lock"></span></button>
+      </div>
+    </header>
 
-  <template id="device-tpl">
-    <div class="panel">
-      <div class="panel-head">
-        <div>
-          <h2 class="dev-name"></h2>
+    <div id="boot" class="boot hidden"><span class="spinner"></span><span id="boot-msg">Starting…</span></div>
+
+    <main class="content">
+
+      <!-- ======================================================== Overview -->
+      <section class="view" data-view="overview">
+        <div class="stats-row">
+          <div class="stat"><span class="stat-ico blue" data-icon="users"></span>
+            <div><div class="stat-value" id="m-nodes">–</div><div class="stat-label">Crews online</div></div></div>
+          <div class="stat"><span class="stat-ico green" data-icon="zap"></span>
+            <div><div class="stat-value" id="m-prop">–</div><div class="stat-label" id="m-prop-label">Write to searchable on another crew</div></div></div>
+          <div class="stat"><span class="stat-ico violet" data-icon="search"></span>
+            <div><div class="stat-value" id="m-search">–</div><div class="stat-label">Search on a node (p50 · p95)</div></div></div>
+          <div class="stat"><span class="stat-ico amber" data-icon="inbox"></span>
+            <div><div class="stat-value" id="m-queue">–</div><div class="stat-label">Waiting to upload</div></div></div>
+        </div>
+
+        <div class="ov-grid">
+          <section class="card">
+            <div class="card-head"><h2>Crews</h2><a class="link small" href="#/crews">Open crews</a></div>
+            <div class="crew-table">
+              <div class="ct-head"><span>Crew</span><span>Status</span><span>Memories</span><span>Waiting</span><span>Review</span><span>Uplink</span></div>
+              <ul class="ct-rows" id="ov-crews"></ul>
+            </div>
+          </section>
+
+          <div class="ov-side">
+            <section class="card">
+              <div class="card-head"><h2>Needs attention</h2></div>
+              <ul class="attention" id="ov-attention"></ul>
+            </section>
+            <section class="card">
+              <div class="card-head"><h2>Recent activity</h2><a class="link small" href="#/activity">View all</a></div>
+              <ul class="log compact-log" id="ov-activity"></ul>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======================================================== Crews (one at a time) -->
+      <section class="view" data-view="crews" hidden>
+        <div class="crew-switch" id="crew-switch"></div>
+        <div class="devices" id="devices"></div>
+      </section>
+
+      <!-- ======================================================== Review (all crews) -->
+      <section class="view" data-view="review" hidden>
+        <div class="review-all" id="review-all"></div>
+      </section>
+
+      <!-- ======================================================== Fleet memory -->
+      <section class="view" data-view="memory" hidden>
+        <div id="demand-box" class="card demand-card hidden">
+          <div class="card-head"><h2>Crews are looking for</h2><span class="muted small">Searches that found nothing on a crew's node</span></div>
+          <ul class="demand" id="demand"></ul>
+        </div>
+        <section class="card">
+          <div class="card-head"><h2>Shared with the fleet <span class="count" id="cloud-count"></span></h2>
+            <span class="muted small"><span id="m-cloud">–</span> memories in Qdrant Server</span></div>
+          <div class="table-head mem-head"><span>Name</span><span>Site</span><span>Author</span><span>Version</span></div>
+          <ul class="cloud-list rows" id="cloud-list"></ul>
+        </section>
+      </section>
+
+      <!-- ======================================================== Activity -->
+      <section class="view" data-view="activity" hidden>
+        <section class="card">
+          <div class="card-head"><h2>Live activity</h2><span class="muted small">Cloud and every crew, newest first</span></div>
+          <ul class="log full-log" id="log"></ul>
+        </section>
+      </section>
+
+      <!-- ======================================================== Network -->
+      <section class="view" data-view="network" id="cloud" hidden>
+        <section class="card map-card">
+          <div class="card-head"><h2>Network</h2><span class="pill" id="cloud-pill">…</span></div>
+          <svg id="map" viewBox="0 0 1000 170" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Cloud and crew nodes"></svg>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>Cloud</h2></div>
+          <dl class="kv">
+            <dt>Status</dt><dd id="cloud-mode">Connecting…</dd>
+            <dt>Sequence</dt><dd><div class="heads" id="heads"></div></dd>
+            <dt>Last sync</dt><dd><span id="m-sync">–</span> <span class="muted" id="m-sync-label"></span></dd>
+          </dl>
+        </section>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- ============================================================ crew template -->
+<template id="device-tpl">
+  <div class="panel">
+    <div class="crew-side">
+      <div class="crew-head">
+        <div class="crew-title">
+          <div class="crew-name-row"><span class="crew-dot"></span><h3 class="dev-name"></h3></div>
           <p class="muted small dev-sites"></p>
         </div>
-        <label class="switch big" title="Cut this tablet's network">
+        <label class="switch" title="The node's uplink to the cloud. Crew phones on the node keep working without it.">
           <input type="checkbox" class="online" />
-          <span class="track"></span><span class="net-label">Online</span>
+          <span class="track"></span>
+          <span class="net-label">Uplink</span>
         </label>
       </div>
-      <div class="status-row">
+      <div class="crew-status">
         <span class="pill conn"></span>
         <span class="muted small last-sync"></span>
-        <span class="spacer"></span>
-        <button class="btn small sync-now">Sync now</button>
       </div>
       <div class="stats">
-        <div><b class="s-mem">0</b><span>memories</span></div>
-        <div><b class="s-queue">0</b><span>queued ↑</span></div>
-        <div><b class="s-local">0</b><span>device-only</span></div>
-        <div class="s-review-box"><b class="s-review">0</b><span>to review</span></div>
+        <div><b class="s-mem">0</b><span>Memories</span></div>
+        <div><b class="s-queue">0</b><span>Waiting</span></div>
+        <div><b class="s-local">0</b><span>Private</span></div>
+        <div class="s-review-box"><b class="s-review">0</b><span>Review</span></div>
       </div>
-
-      <form class="ask row">
-        <input class="q" placeholder="Ask your memory, e.g. what before working on a line?" autocomplete="off" />
+      <form class="ask">
+        <input class="q" placeholder="Ask this crew's memory" autocomplete="off" maxlength="400" />
         <button class="btn primary">Ask</button>
       </form>
       <div class="answer hidden"></div>
+      <div class="crew-actions">
+        <a class="link field-link" target="_blank" rel="noopener">Open field app</a>
+        <button class="link sync-now">Sync now</button>
+        <button class="link scale-test" title="Build a throwaway 20,000-memory shard on this node and time the search">Run 20k benchmark</button>
+        <button class="link danger remove-node hidden" data-op>Remove</button>
+      </div>
+    </div>
 
+    <div class="crew-main">
       <nav class="tabs" role="tablist">
         <button data-tab="memory" class="active">Memory</button>
         <button data-tab="add">Add</button>
         <button data-tab="review">Review <span class="badge review-badge"></span></button>
-        <button data-tab="queue">Queue</button>
+        <button data-tab="queue">Waiting</button>
+        <button data-tab="activity">Activity</button>
       </nav>
+
       <div class="tab" data-pane="memory">
         <div class="filters">
           <button class="fchip active" data-f="all">All</button>
-          <button class="fchip" data-f="own">This device</button>
-          <button class="fchip" data-f="fleet">Fleet mirror</button>
+          <button class="fchip" data-f="own">This node</button>
+          <button class="fchip" data-f="fleet">Fleet</button>
         </div>
-        <ul class="list memory"></ul>
+        <div class="table-head"><span>Name</span><span>Status</span><span>Updated</span></div>
+        <ul class="memory rows"></ul>
       </div>
+
       <div class="tab hidden" data-pane="add">
         <form class="add-form">
           <input type="hidden" class="f-id" />
-          <input class="f-title" placeholder="Title" />
-          <textarea class="f-text" rows="4" placeholder="What did you find or fix? Saved on the tablet instantly, even offline."></textarea>
-          <div class="row">
+          <input class="f-title" placeholder="Title" maxlength="160" />
+          <textarea class="f-text" rows="5" maxlength="4000" placeholder="What did you find or fix? Saved on the node immediately, with or without a network."></textarea>
+          <div class="form-row">
             <label>Kind <select class="f-kind"></select></label>
             <label>Site <select class="f-site"></select></label>
-            <label>Share
+            <label>Sharing
               <select class="f-vis">
-                <option value="auto">auto (policy)</option>
-                <option value="shared">shared</option>
-                <option value="private">private</option>
+                <option value="auto">Automatic</option>
+                <option value="shared">Share with fleet</option>
+                <option value="private">Keep private</option>
               </select>
             </label>
           </div>
           <div class="policy-preview"></div>
-          <div class="row">
-            <button class="btn primary save">Save on tablet</button>
-            <button type="button" class="btn ghost cancel hidden">Cancel edit</button>
+          <div class="form-actions">
+            <button class="btn primary save">Save</button>
+            <button type="button" class="btn cancel hidden">Cancel</button>
           </div>
         </form>
       </div>
-      <div class="tab hidden" data-pane="review"><div class="review"></div></div>
-      <div class="tab hidden" data-pane="queue">
-        <p class="muted small">Uploaded in priority order when the network returns: safety first.</p>
-        <ol class="list queue"></ol>
-      </div>
-      <div class="down hidden">Tablet process not running.</div>
-    </div>
-  </template>
 
-  <div id="toast" class="toast hidden" role="status"></div>
-  <script src="/static/app.js"></script>
+      <div class="tab hidden" data-pane="review"><div class="review"></div></div>
+
+      <div class="tab hidden" data-pane="queue">
+        <p class="muted small">Uploaded in priority order when the uplink returns. Safety items go first.</p>
+        <ul class="queue rows"></ul>
+      </div>
+
+      <div class="tab hidden" data-pane="activity"><ul class="log dev-log"></ul></div>
+    </div>
+    <div class="down hidden">This node is not reachable.</div>
+  </div>
+</template>
+
+<!-- ============================================================ dialogs -->
+<dialog id="join-dlg" class="dlg">
+  <form method="dialog" class="dlg-inner">
+    <div class="dlg-head"><h2>Connect a phone</h2><button class="icon-btn" aria-label="Close"><span data-icon="close"></span></button></div>
+    <div class="join-grid">
+      <div class="join-main">
+        <img id="join-qr" alt="QR code for the field app" />
+        <p class="mono small" id="join-url"></p>
+        <p class="muted small">Scan on a phone connected to the same Wi-Fi, then pick a crew.</p>
+      </div>
+      <div class="join-side">
+        <h3>Open a specific crew</h3>
+        <ul class="join-list" id="join-nodes"></ul>
+        <div id="join-laptop" class="hidden">
+          <h3>Add a laptop as a crew node</h3>
+          <p class="muted small">Join code <b class="mono" id="join-code"></b></p>
+          <pre class="cmd" id="join-cmd"></pre>
+        </div>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="node-dlg" class="dlg narrow">
+  <form class="dlg-inner" id="node-form">
+    <div class="dlg-head"><h2>Add a crew node</h2></div>
+    <p class="muted small">Starts a new node on this machine with its own memory. It joins the fleet and downloads shared knowledge.</p>
+    <label class="form-field">Name <input id="node-label" placeholder="Line crew C · Pune circle" maxlength="60" /></label>
+    <div class="form-field">Sites <div class="checks" id="node-sites"></div></div>
+    <div class="form-actions"><button class="btn primary">Add crew</button><button type="button" class="btn" id="node-cancel">Cancel</button></div>
+  </form>
+</dialog>
+
+<dialog id="pin-dlg" class="dlg narrow">
+  <form class="dlg-inner" id="pin-form">
+    <div class="dlg-head"><h2>Operator PIN</h2></div>
+    <p class="muted small">Admin actions from other devices need the PIN shown in the hub's terminal.</p>
+    <input id="pin" inputmode="numeric" autocomplete="off" maxlength="12" placeholder="PIN" />
+    <div class="form-actions"><button class="btn primary">Unlock</button><button type="button" class="btn" id="pin-cancel">Cancel</button></div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/static/common.js"></script>
+<script src="/static/app.js"></script>
 </body>
 </html>

@@ -22,16 +22,68 @@ import threading
 import time
 import uuid
 
+import base64
+import io
+
 from qdrant_edge import (
-    CountRequest, Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams, FieldCondition,
-    Filter, Fusion, MatchValue, Modifier, Point, Prefetch, Query, QueryRequest, ScrollRequest, UpdateOperation,
+    CountRequest, DecayKind, Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams, Expression,
+    FacetRequest, FieldCondition, Filter, Formula, Fusion, MatchValue, Mmr, Modifier, PayloadSchemaType, Point,
+    Prefetch, Query, QueryRequest, ScrollRequest, UpdateOperation,
 )
 
 from . import config, embeddings, facts, policy
 
-NOT_DELETED = Filter(must_not=[FieldCondition(key="deleted", match=MatchValue(value=True))])
+# keyword flags (see config.with_flags): bool matching is broken in qdrant-edge-py 0.8
+NOT_DELETED = Filter(must_not=[FieldCondition(key="status", match=MatchValue(value="deleted"))])
+HAS_PHOTO = FieldCondition(key="photo", match=MatchValue(value="yes"))
 OWN_STATES = ("local_only", "suggested", "pending", "conflict", "synced", "redacted_synced")
-TRANSIENT = {"layer", "score", "match", "similarity", "found_on"}
+TRANSIENT = {"layer", "score", "match", "similarity", "found_on", "why"}
+INDEXES = (("kind", PayloadSchemaType.Keyword), ("site", PayloadSchemaType.Keyword),
+           ("updated_at", PayloadSchemaType.Float), ("status", PayloadSchemaType.Keyword),
+           ("photo", PayloadSchemaType.Keyword))
+RECENCY_SCALE = 90 * 86400   # a memory 90 days older than another ranks ~10% lower at equal relevance
+PHOTO_MIN = 0.26             # CLIP text->photo: matches ~0.30+, look-alikes ~0.25, unrelated <0.20
+
+
+class _Rows:
+    def __init__(self, rows, rowcount):
+        self.rows, self.rowcount = rows, rowcount
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return self.rows
+
+
+class LockedDB:
+    """One SQLite connection shared by the API threads, the sync worker, the live listener and
+    the event streams. Python's sqlite3 connection must not be used by two threads at once."""
+
+    def __init__(self, path):
+        self._c = sqlite3.connect(path, check_same_thread=False)
+        self._l = threading.RLock()
+
+    def execute(self, sql, params=()):
+        with self._l:
+            cur = self._c.execute(sql, params)
+            return _Rows(cur.fetchall(), cur.rowcount)
+
+    def executemany(self, sql, seq):
+        with self._l:
+            self._c.executemany(sql, seq)
+
+    def executescript(self, sql):
+        with self._l:
+            self._c.executescript(sql)
+
+    def commit(self):
+        with self._l:
+            self._c.commit()
+
+    def close(self):
+        with self._l:
+            self._c.close()
 
 
 def cosine(a, b):
@@ -64,20 +116,73 @@ def keyword_overlap(query, doc):
 
 def shard_config():
     return EdgeConfig(
-        vectors={"dense": EdgeVectorParams(size=config.DENSE_DIM, distance=Distance.Cosine)},
+        vectors={"dense": EdgeVectorParams(size=config.DENSE_DIM, distance=Distance.Cosine),
+                 "image": EdgeVectorParams(size=config.IMAGE_DIM, distance=Distance.Cosine)},
         sparse_vectors={"bm25": EdgeSparseVectorParams(modifier=Modifier.Idf)},
     )
 
 
+VECS = ["dense", "image"]
+
+
+def _with_vectors(rec, with_vector):
+    doc = dict(rec.payload)
+    if with_vector:
+        doc["_dense"] = rec.vector["dense"]
+        if rec.vector.get("image"):
+            doc["_image"] = rec.vector["image"]
+    return doc
+
+
+def recency_formula():
+    """Qdrant formula rescoring: relevance x (0.8 + 0.2 x exp-decay of age). Fresh fixes win ties."""
+    E = Expression
+    decay = E.Decay(DecayKind.Exp, E.Variable("updated_at"), E.Constant(time.time()), 0.5, RECENCY_SCALE)
+    return Formula(E.Mult([E.Variable("$score"), E.Sum([E.Constant(0.8), E.Mult([E.Constant(0.2), decay])])]),
+                   defaults={"updated_at": 0.0})
+
+
+def make_thumb(img, size=320, quality=72):
+    from PIL import Image  # noqa: F401
+    t = img.copy()
+    t.thumbnail((size, size))
+    buf = io.BytesIO()
+    t.save(buf, "JPEG", quality=quality, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def decode_photo(data_url):
+    """Validate an uploaded photo (data URL or base64) and return a normalised RGB image."""
+    from PIL import Image, ImageOps
+    raw = base64.b64decode(data_url.split(",", 1)[-1], validate=False)
+    img = Image.open(io.BytesIO(raw))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((1280, 1280))
+    return img
+
+
+QUIET_META = {"last_sync", "cloud_snapshots", "clock_offset", "bytes_partial_total", "bytes_full_total",
+              "bytes_points_total"}
+
+
 class EdgeDevice:
-    def __init__(self, dev_id: str):
-        cfg = config.DEVICES[dev_id]
-        self.id, self.label, self.sites = dev_id, cfg["label"], list(cfg["sites"])
+    def __init__(self, dev_id: str, label: str = "", sites=None):
+        self.id, self.label = dev_id, label or dev_id
+        self.sites = [s for s in (sites or ["global"]) if s in config.SITES]
         self.lock = threading.RLock()
+        self.version = 0  # bumped on every visible change; drives the live event stream
         self.dir = config.DATA_DIR / "devices" / dev_id
+        marker = self.dir / "schema.txt"
+        stamp = f"{config.SCHEMA}:{embeddings.get().dense.name}"
+        if self.dir.exists() and any(self.dir.iterdir()) and (not marker.exists() or marker.read_text() != stamp):
+            # shards from an older layout or another embedding model: keep them aside, never delete a crew's notes
+            self.dir.rename(self.dir.with_name(f"{dev_id}.old-{int(time.time())}"))
         (self.dir / "mirrors").mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(self.dir / "tmp", ignore_errors=True)  # leftovers of interrupted downloads
         (self.dir / "tmp").mkdir(exist_ok=True)
-        self.db = sqlite3.connect(self.dir / "state.sqlite", check_same_thread=False)
+        (self.dir / "photos").mkdir(exist_ok=True)
+        marker.write_text(stamp)
+        self.db = LockedDB(self.dir / "state.sqlite")
         self._init_db()
         self.local = self._open(self.dir / "local")
         self.mirrors = {s: self._load_if_exists(self.mirror_path(s)) for s in self.sites}
@@ -88,7 +193,10 @@ class EdgeDevice:
         if path.exists() and any(path.iterdir()):
             return EdgeShard.load(str(path))
         path.mkdir(parents=True, exist_ok=True)
-        return EdgeShard.create(str(path), shard_config())
+        shard = EdgeShard.create(str(path), shard_config())
+        for field, schema in INDEXES:  # payload indexes: fast filters + native facets
+            shard.update(UpdateOperation.create_field_index(field, schema))
+        return shard
 
     @staticmethod
     def _load_if_exists(path):
@@ -111,6 +219,9 @@ class EdgeDevice:
                     top REAL, sent INT DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, level TEXT, event TEXT,
                     detail TEXT);
+                CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY AUTOINCREMENT, doc_id TEXT, ts REAL,
+                    version INT, author TEXT, event TEXT, title TEXT, text TEXT);
+                CREATE INDEX IF NOT EXISTS history_doc ON history(doc_id, ts);
                 """
             )
             self.db.commit()
@@ -134,19 +245,31 @@ class EdgeDevice:
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, json.dumps(value)))
             self.db.commit()
+            if key not in QUIET_META:
+                self.version += 1
+
+    def bump(self):
+        with self.lock:
+            self.version += 1
 
     @property
     def online(self):
+        """The node's uplink (the crew van's 4G). Crew phones on the node's local Wi-Fi keep working either way."""
         return self.meta("online", True)
 
     def log(self, event, detail="", level="info"):
         with self.lock:
             self.db.execute("INSERT INTO log(ts,level,event,detail) VALUES(?,?,?,?)", (time.time(), level, event, detail))
             self.db.commit()
+            self.version += 1
 
-    def recent_log(self, limit=60):
-        rows = self.db.execute("SELECT ts,level,event,detail FROM log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [{"ts": r[0], "level": r[1], "event": r[2], "detail": r[3], "device": self.id} for r in rows]
+    def recent_log(self, limit=60, after_id=0):
+        rows = self.db.execute("SELECT id,ts,level,event,detail FROM log WHERE id>? ORDER BY id DESC LIMIT ?",
+                               (after_id, limit)).fetchall()
+        return [{"id": r[0], "ts": r[1], "level": r[2], "event": r[3], "detail": r[4], "device": self.id} for r in rows]
+
+    def last_log_id(self):
+        return self.db.execute("SELECT COALESCE(MAX(id),0) FROM log").fetchone()[0]
 
     # ================================================================ mirrors (fleet copies)
     def mirror_seq(self, site):
@@ -168,10 +291,8 @@ class EdgeDevice:
             except OSError:
                 pass
 
-    def restore_mirror(self, site, data: bytes, seq: int):
+    def restore_mirror(self, site, snap, seq: int, wire_bytes: int):
         """Bootstrap a site mirror from a FULL server snapshot (unpacked into a fresh folder, then swapped in)."""
-        snap = self.dir / "tmp" / f"{site}-full-{uuid.uuid4().hex[:6]}.snapshot"
-        snap.write_bytes(data)
         name, target = self._new_mirror_dir(site)
         EdgeShard.unpack_snapshot(str(snap), str(target))
         with self.lock:
@@ -179,7 +300,7 @@ class EdgeDevice:
             self.mirrors[site] = EdgeShard.load(str(target))
             self.set_meta(f"mirror_dir_{site}", name)
             self.set_meta(f"mirror_seq_{site}", seq)
-            self.set_meta(f"full_bytes_{site}", len(data))
+            self.set_meta(f"full_bytes_{site}", wire_bytes)
             if old:
                 old.close()
         self._cleanup(snap)
@@ -190,10 +311,8 @@ class EdgeDevice:
         with self.lock:
             return self.mirrors[site].snapshot_manifest()
 
-    def apply_partial(self, site, data: bytes, seq: int):
+    def apply_partial(self, site, snap, seq: int):
         """Refresh a mirror with a PARTIAL snapshot: only segments that changed on the server."""
-        snap = self.dir / "tmp" / f"{site}-part-{uuid.uuid4().hex[:6]}.snapshot"
-        snap.write_bytes(data)
         tmp = self.dir / "tmp" / f"unpack-{uuid.uuid4().hex[:6]}"
         tmp.mkdir()
         with self.lock:
@@ -216,10 +335,13 @@ class EdgeDevice:
                 vec = {"dense": d["dense"]}
                 if text:
                     vec["bm25"] = emb.sparse_doc(text)
+                if d.get("image"):
+                    vec["image"] = d["image"]
                 pts.append(Point(p["doc_id"], vec, p))
             if pts:
                 self.mirrors[site].update(UpdateOperation.upsert_points(pts))
-            self.set_meta(f"mirror_seq_{site}", max(head, max((d["payload"]["seq"] for d in docs), default=0)))
+            self.set_meta(f"mirror_seq_{site}", max(self.mirror_seq(site), head,
+                                                    max((d["payload"]["seq"] for d in docs), default=0)))
 
     # ================================================================ point access
     def _shards(self):
@@ -227,25 +349,19 @@ class EdgeDevice:
 
     def get_local(self, doc_id, with_vector=False):
         with self.lock:
-            recs = self.local.retrieve([doc_id], with_payload=True, with_vector=["dense"] if with_vector else False)
+            recs = self.local.retrieve([doc_id], with_payload=True, with_vector=VECS if with_vector else False)
         if not recs:
             return None
-        doc = dict(recs[0].payload)
-        if with_vector:
-            doc["_dense"] = recs[0].vector["dense"]
-        return doc
+        return _with_vectors(recs[0], with_vector)
 
     def get_mirror(self, doc_id, site=None, with_vector=False):
         with self.lock:
             for s, m in self.mirrors.items():
                 if m is None or (site and s != site):
                     continue
-                recs = m.retrieve([doc_id], with_payload=True, with_vector=["dense"] if with_vector else False)
+                recs = m.retrieve([doc_id], with_payload=True, with_vector=VECS if with_vector else False)
                 if recs:
-                    doc = dict(recs[0].payload)
-                    if with_vector:
-                        doc["_dense"] = recs[0].vector["dense"]
-                    return doc
+                    return _with_vectors(recs[0], with_vector)
         return None
 
     def get(self, doc_id, with_vector=False):
@@ -255,12 +371,15 @@ class EdgeDevice:
         emb = embeddings.get()
         if dense is None:
             dense = emb.embed_dense(f"{doc.get('title', '')}. {doc['text']}")
-        payload = {k: v for k, v in doc.items() if not k.startswith("_") and k not in TRANSIENT}
+        payload = config.with_flags({k: v for k, v in doc.items() if not k.startswith("_") and k not in TRANSIENT})
         vec = {"dense": dense}
         if doc.get("text"):
             vec["bm25"] = emb.sparse_doc(f"{doc.get('title', '')} {doc['text']}")
+        if doc.get("_image"):
+            vec["image"] = doc["_image"]
         with self.lock:
             self.local.update(UpdateOperation.upsert_points([Point(doc["doc_id"], vec, payload)]))
+            self.version += 1
         return dense
 
     def remove_local(self, doc_id):
@@ -268,17 +387,69 @@ class EdgeDevice:
             self.local.update(UpdateOperation.delete_points([doc_id]))
             self.db.execute("DELETE FROM outbox WHERE doc_id=?", (doc_id,))
             self.db.commit()
+            self.version += 1
 
     def enqueue(self, doc_id, op, priority):
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO outbox(doc_id,op,priority,queued_at,attempts) VALUES(?,?,?,?,0)",
                             (doc_id, op, priority, time.time()))
             self.db.commit()
+            self.version += 1
 
     def dequeue(self, doc_id):
         with self.lock:
             self.db.execute("DELETE FROM outbox WHERE doc_id=?", (doc_id,))
             self.db.commit()
+            self.version += 1
+
+    # ================================================================ cloud epoch
+    def rehydrate(self, epoch):
+        """The fleet was reset or restored (new cloud epoch): drop the mirrors, keep everything this
+        node wrote, and queue it again so the fleet gets it back. Edge nodes re-seed the cloud."""
+        emb = embeddings.get()
+        with self.lock:
+            own = {}
+            for s, m in self.mirrors.items():
+                if m is None:
+                    continue
+                offset = None
+                while True:
+                    recs, offset = m.scroll(ScrollRequest(offset=offset, limit=256, with_payload=True,
+                                                          with_vector=VECS))
+                    for r in recs:
+                        p = _with_vectors(r, True)
+                        if p.get("author_device") == self.id and not p.get("deleted"):
+                            own[p["doc_id"]] = (p, p.pop("_dense"))
+                    if offset is None:
+                        break
+            old_paths = [self.mirror_path(s) for s in self.sites]
+            for m in self.mirrors.values():
+                if m:
+                    m.close()
+            self.mirrors = {s: None for s in self.sites}
+            for s in self.sites:
+                self.db.execute("DELETE FROM meta WHERE key IN (?,?,?)",
+                                (f"mirror_seq_{s}", f"mirror_dir_{s}", f"full_bytes_{s}"))
+            self.db.execute("DELETE FROM conflicts")
+            self.db.execute("DELETE FROM outbox")
+            self.db.commit()
+        for p in self.local_docs():
+            if p.get("deleted"):
+                self.remove_local(p["doc_id"])
+            elif p.get("sync_state") not in ("local_only", "suggested"):
+                full = self.get_local(p["doc_id"], with_vector=True)
+                own[p["doc_id"]] = (full, full.pop("_dense"))
+        for doc_id, (p, dense) in own.items():
+            p = {k: v for k, v in p.items() if k not in ("pushed_version", "seq", "synced_at", "similar_to")}
+            p.update(version=0, base_version=0, sync_state="pending")
+            p.setdefault("policy", {"decision": "sync", "priority": 2, "reasons": ["re-published after a cloud reset"]})
+            self.put_local(p, dense)
+            self.enqueue(doc_id, "upsert", p["policy"].get("priority", 2))
+        self._cleanup(*old_paths)
+        self.set_meta("epoch", epoch)
+        self.log("cloud epoch changed", f"fleet data was reset; rebuilding mirrors and re-publishing "
+                                        f"{len(own)} memories written on this node", "warn")
+        return len(own)
 
     def outbox(self):
         rows = self.db.execute("SELECT doc_id,op,priority,queued_at,attempts,last_error FROM outbox "
@@ -331,11 +502,11 @@ class EdgeDevice:
         return row[0] if row else 0
 
     # ================================================================ user operations
-    def write(self, text, title="", kind="note", site=None, visibility="auto", doc_id=None):
-        """Create or edit a memory. Identical online and offline."""
+    def write(self, text, title="", kind="note", site=None, visibility="auto", doc_id=None, photo=None):
+        """Create or edit a memory. Identical online and offline. `photo`: a data URL from the camera."""
         now = time.time()
-        local = self.get_local(doc_id) if doc_id else None
-        existing = local or (self.get_mirror(doc_id) if doc_id else None)
+        local = self.get_local(doc_id, with_vector=True) if doc_id else None
+        existing = local or (self.get_mirror(doc_id, with_vector=True) if doc_id else None)
         if existing is None:
             base = 0
         elif local is None or local.get("sync_state") in ("synced", "redacted_synced"):
@@ -349,19 +520,30 @@ class EdgeDevice:
             site = existing["site"] if existing else self.sites[0]
 
         emb = embeddings.get()
+        if not text.strip() and photo:
+            text = title.strip() or "Photo evidence"
         title = title.strip() or text.strip()[:60]
         dense = emb.embed_dense(f"{title}. {text.strip()}")
+        doc_id = doc_id or str(uuid.uuid4())
+        image, thumb = (existing or {}).get("_image"), (existing or {}).get("thumb")
+        if photo:
+            image, thumb = self.save_photo(doc_id, photo)
         demand = self.best_demand(dense)
         decision = policy.decide(f"{title} {text}", kind, visibility, demand, self.access_count(doc_id) if doc_id else 0,
                                  emb.demand_threshold)
         doc = {
-            "doc_id": doc_id or str(uuid.uuid4()), "title": title, "text": text.strip(), "kind": kind, "site": site,
+            "doc_id": doc_id, "title": title, "text": text.strip(), "kind": kind, "site": site,
             "visibility": visibility, "policy": decision,
             "origin_device": existing.get("origin_device", self.id) if existing else self.id,
             "author_device": self.id, "created_at": existing.get("created_at", now) if existing else now,
             "updated_at": now, "edits": (existing.get("edits", 0) + 1) if existing else 0,
             "version": base, "base_version": base, "deleted": False,
         }
+        if thumb:
+            doc.update(has_photo=True, thumb=thumb,
+                       photo_by=self.id if photo else (existing or {}).get("photo_by", self.id))
+        if image:
+            doc["_image"] = image
         if decision["decision"] in ("local", "suggest"):
             doc["sync_state"] = "local_only" if decision["decision"] == "local" else "suggested"
             self.dequeue(doc["doc_id"])
@@ -374,9 +556,73 @@ class EdgeDevice:
 
         doc["contradicts"] = self.check_contradictions(doc, dense)
         self.put_local(doc, dense)
+        self.record_history(doc, "edited on this node" if existing else "created on this node")
         self.log("memory edited" if existing else "memory saved",
-                 f"'{title}' → {decision['decision']} · " + "; ".join(decision["reasons"]))
+                 f"'{title}' → {decision['decision']} · " + "; ".join(decision["reasons"])
+                 + (" · photo embedded on the node" if photo else ""))
+        doc.pop("_image", None)
         return doc
+
+    # ================================================================ memory history
+    def record_history(self, doc, event):
+        """Every version a node sees of a memory: created, edited here, received from crew X, merged."""
+        with self.lock:
+            last = self.db.execute("SELECT version, text, title FROM history WHERE doc_id=? ORDER BY id DESC LIMIT 1",
+                                   (doc["doc_id"],)).fetchone()
+            if last and last[1] == doc.get("text") and last[2] == doc.get("title") and not event.startswith("deleted"):
+                return
+            self.db.execute("INSERT INTO history(doc_id,ts,version,author,event,title,text) VALUES(?,?,?,?,?,?,?)",
+                            (doc["doc_id"], doc.get("updated_at") or time.time(), doc.get("version", 0),
+                             doc.get("author_device", self.id), event, doc.get("title", ""), doc.get("text", "")))
+            self.db.commit()
+
+    def history(self, doc_id):
+        rows = self.db.execute("SELECT ts,version,author,event,title,text FROM history WHERE doc_id=? ORDER BY id",
+                               (doc_id,)).fetchall()
+        return [dict(zip(("ts", "version", "author", "event", "title", "text"), r)) for r in rows]
+
+    # ================================================================ photos
+    def save_photo(self, doc_id, data_url):
+        """Full photo stays on this node; the fleet gets a small thumbnail and a CLIP vector."""
+        img = decode_photo(data_url)
+        path = self.dir / "photos" / f"{doc_id}.jpg"
+        img.save(path, "JPEG", quality=85)
+        vision = embeddings.vision()
+        image = vision.embed_image(path) if vision.available() else None
+        return image, make_thumb(img)
+
+    def photo_path(self, doc_id):
+        p = self.dir / "photos" / f"{doc_id}.jpg"
+        return p if p.exists() else None
+
+    def photo_count(self):
+        flt = Filter(must=[HAS_PHOTO], must_not=NOT_DELETED.must_not)
+        with self.lock:
+            return sum(sh.count(CountRequest(exact=True, filter=flt)) for _, _, sh in self._shards())
+
+    def search_photo(self, data_url, limit=6):
+        """Photo -> photo: 'have we seen this before?' Runs on the node's shards, offline."""
+        t0 = time.perf_counter()
+        img = decode_photo(data_url)
+        tmp = self.dir / "tmp" / f"q-{uuid.uuid4().hex[:6]}.jpg"
+        img.save(tmp, "JPEG", quality=85)
+        try:
+            qv = embeddings.vision().embed_image(tmp)
+        finally:
+            self._cleanup(tmp)
+        req = QueryRequest(limit=limit, query=Query.Nearest(qv, using="image"), filter=NOT_DELETED, with_payload=True)
+        best = {}
+        with self.lock:
+            for layer, _, shard in self._shards():
+                for r in shard.query(req):
+                    d = dict(r.payload, score=round(r.score, 3), match=round(r.score, 3), layer=layer,
+                             why={"photo": round(r.score, 3)})
+                    if layer == "mirror":
+                        d["sync_state"] = "synced"
+                    if d["doc_id"] not in best or layer == "local":
+                        best[d["doc_id"]] = d
+        results = sorted(best.values(), key=lambda d: -d["score"])[:limit]
+        return {"latency_ms": round((time.perf_counter() - t0) * 1000, 1), "results": results, "mode": "photo"}
 
     def delete(self, doc_id):
         local = self.get_local(doc_id)
@@ -391,6 +637,7 @@ class EdgeDevice:
             tomb = dict(doc, deleted=True, sync_state="pending", updated_at=time.time(), author_device=self.id,
                         base_version=base, version=base)
             self.put_local(tomb)
+            self.record_history(tomb, "deleted on this node")
             self.enqueue(doc_id, "delete", 1)
             self.log("delete queued", f"'{doc['title']}' will be removed from the fleet on next sync")
         else:
@@ -410,26 +657,39 @@ class EdgeDevice:
         return self.write(doc["text"], doc["title"], doc["kind"], site, "shared", doc_id)
 
     # ================================================================ search
-    def search(self, query, limit=6, kind=None, mode="hybrid", log_miss=True):
+    def search(self, query, limit=6, kind=None, mode="hybrid", log_miss=True, site=None, diverse=False):
+        """Hybrid retrieval on the node's Qdrant Edge shards, fully offline:
+            meaning (dense) + keywords (BM25) [+ photos (CLIP text->image) when the node has photos]
+            -> RRF fusion -> recency formula (or MMR diversity for answers).
+        Every result carries `why`: its meaning / keyword / photo score, so the ranking is explainable."""
         emb = embeddings.get()
         t0 = time.perf_counter()
         qd = emb.embed_query(query)
         qs = emb.sparse_query(query)
-        must = [FieldCondition(key="kind", match=MatchValue(value=kind))] if kind else None
-        flt = Filter(must=must, must_not=NOT_DELETED.must_not)
+        must = [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in (("kind", kind), ("site", site)) if v]
+        flt = Filter(must=must or None, must_not=NOT_DELETED.must_not)
         dense_q, sparse_q = Query.Nearest(qd, using="dense"), Query.Nearest(qs, using="bm25")
+        legs = {"meaning": (dense_q, 30, None), "keywords": (sparse_q, 30, None)}
+        vision = embeddings.vision()
+        if mode in ("hybrid", "photo") and vision.available() and self.photo_count():
+            legs["photo"] = (Query.Nearest(vision.embed_text(query), using="image"), 10, PHOTO_MIN)
         if mode == "dense":
             req = QueryRequest(limit=limit * 2, query=dense_q, filter=flt, with_payload=True, with_vector=["dense"])
         elif mode == "keyword":
             req = QueryRequest(limit=limit * 2, query=sparse_q, filter=flt, with_payload=True, with_vector=["dense"])
+        elif mode == "photo" and "photo" in legs:
+            req = QueryRequest(limit=limit * 2, query=legs["photo"][0], filter=flt, score_threshold=PHOTO_MIN,
+                               with_payload=True, with_vector=["dense"])
         else:
-            req = QueryRequest(limit=limit * 2, prefetches=[Prefetch(limit=30, query=dense_q, filter=flt),
-                                                            Prefetch(limit=30, query=sparse_q, filter=flt)],
-                               query=Fusion.Rrf(k=60), with_payload=True, with_vector=["dense"])
+            fused = Prefetch(limit=40, query=Fusion.Rrf(k=60),
+                             prefetches=[Prefetch(limit=n, query=q, filter=flt, score_threshold=th)
+                                         for q, n, th in legs.values()])
+            final = Mmr(qd, 0.7, 30, using="dense") if diverse else recency_formula()
+            req = QueryRequest(limit=limit * 2, prefetches=[fused], query=final, with_payload=True, with_vector=["dense"])
         t1 = time.perf_counter()
         best = {}
         with self.lock:
-            for layer, site, shard in self._shards():
+            for layer, _site, shard in self._shards():
                 for r in shard.query(req):
                     d = dict(r.payload)
                     d.update(score=round(r.score, 4), match=round(cosine(qd, r.vector["dense"]), 3), layer=layer)
@@ -443,7 +703,32 @@ class EdgeDevice:
                 loc = self.local.retrieve([doc_id], with_payload=True, with_vector=False)
                 if loc and loc[0].payload.get("deleted"):
                     best.pop(doc_id)
-        ms_shards = (time.perf_counter() - t1) * 1000
+            ms_shards = (time.perf_counter() - t1) * 1000
+            # Each leg across ALL shards (sub-ms queries). Used twice:
+            #  1. explainability: every result shows its meaning / keyword / photo score
+            #  2. correct cross-shard ranking: RRF is rank-based, so a shard's own fusion scores are not
+            #     comparable between a 3-memory local shard and a 5,000-memory mirror. Candidates come
+            #     from Qdrant's per-shard fusion; the final order is RRF over each leg's GLOBAL rank,
+            #     times the same recency decay (what a distributed Qdrant does across shards).
+            leg_scores = {leg: {} for leg in legs}
+            for leg, (q, n, th) in legs.items():
+                for _, _, shard in self._shards():
+                    for r in shard.query(QueryRequest(limit=n, query=q, filter=flt, with_payload=False,
+                                                      score_threshold=th)):
+                        rid = str(r.id)
+                        if r.score > leg_scores[leg].get(rid, float("-inf")):
+                            leg_scores[leg][rid] = r.score
+            fused_mode = mode == "hybrid" or (mode == "photo" and "photo" not in legs)
+            rrf = {}
+            for leg, sc in leg_scores.items():
+                for rank, rid in enumerate(sorted(sc, key=sc.get, reverse=True), 1):
+                    rrf[rid] = rrf.get(rid, 0.0) + 1.0 / (60 + rank)
+            now = time.time()
+            for doc_id, d in best.items():
+                d["why"] = {leg: round(sc[doc_id], 3) for leg, sc in leg_scores.items() if doc_id in sc}
+                if fused_mode:
+                    age = max(0.0, now - float(d.get("updated_at") or 0))
+                    d["score"] = round(rrf.get(doc_id, 0.0) * (0.8 + 0.2 * 0.5 ** (age / RECENCY_SCALE)), 5)
         results = sorted(best.values(), key=lambda d: d["score"], reverse=True)[:limit]
         ms_total = (time.perf_counter() - t0) * 1000
         top = max((r["match"] for r in results), default=0.0)
@@ -455,8 +740,10 @@ class EdgeDevice:
             self.db.execute("INSERT INTO searches(ts,q,ms_total,ms_shards,top,hits) VALUES(?,?,?,?,?,?)",
                             (now, query, ms_total, ms_shards, top, len(results)))
             self.db.commit()
+            self.version += 1
         overlap = keyword_overlap(query, results[0]) if results else 0
-        miss = top < emb.miss_threshold and overlap < 2
+        photo_hit = any(r.get("why", {}).get("photo", 0) >= PHOTO_MIN + 0.03 for r in results)
+        miss = top < emb.miss_threshold and overlap < 2 and not photo_hit
         if miss and log_miss:
             self.record_miss(query, qd, top)
         return {"latency_ms": round(ms_total, 2), "shard_ms": round(ms_shards, 2), "results": results,
@@ -580,11 +867,81 @@ class EdgeDevice:
                              for s, m in self.mirrors.items()}
         private = by_state.get("local_only", 0) + by_state.get("suggested", 0) + by_state.get("redacted_synced", 0)
         return {
+            "kinds": self.facets("kind"), "photos": self.photo_count(),
             "memories": len(self.merged_docs()), "own": len(own), "by_state": by_state, "mirrors": mirror_counts,
             "outbox": len(self.outbox()), "conflicts": len(self.conflicts()),
             "contradictions": len(self.contradictions()), "suggestions": by_state.get("suggested", 0),
             "private_pct": round(100 * private / len(own)) if own else 0,
         }
+
+    def scale_test(self, n=20000, queries=100):
+        """Live proof of scale: a throwaway Qdrant Edge shard with `n` memories, queried with the
+        SAME hybrid pipeline (dense + BM25 -> RRF -> recency formula) the node uses. Vectors are
+        real embeddings of field phrases, perturbed (embedding 20k texts would take minutes)."""
+        import random
+        import numpy as np
+        from .seed import FLEET
+        rnd = random.Random(7)
+        emb = embeddings.get()
+        phrases = [f"{t}. {x}" for _, _, t, x in FLEET]
+        base = np.array(emb.embed_many(phrases), dtype=np.float32)
+        words = " ".join(phrases).lower().split()
+        path = self.dir / "tmp" / f"scale-{uuid.uuid4().hex[:6]}"
+        path.mkdir(parents=True)
+        shard = EdgeShard.create(str(path), shard_config())
+        try:
+            t0 = time.perf_counter()
+            now = time.time()
+            for k in range(0, n, 1000):
+                m = min(1000, n - k)
+                v = base[np.array([rnd.randrange(len(base)) for _ in range(m)])] + \
+                    np.random.default_rng(k).normal(0, 0.035, (m, base.shape[1])).astype(np.float32)
+                v /= np.linalg.norm(v, axis=1, keepdims=True)
+                pts = []
+                for j in range(m):
+                    text = " ".join(rnd.choice(words) for _ in range(24))
+                    pts.append(Point(str(uuid.uuid4()), {"dense": v[j].tolist(), "bm25": emb.sparse_doc(text)},
+                                     {"kind": "fix", "status": "active", "updated_at": now - rnd.random() * 3e7}))
+                shard.update(UpdateOperation.upsert_points(pts))
+            load_s = time.perf_counter() - t0
+            t1 = time.perf_counter()
+            shard.optimize()  # build the HNSW index, as Qdrant does in the background on a real shard
+            index_s = time.perf_counter() - t1
+            qs = [rnd.choice(phrases)[:60] for _ in range(queries)]
+            qv = [(emb.embed_query(q), emb.sparse_query(q)) for q in qs]
+            lat = []
+            for d, sp in qv:
+                req = QueryRequest(limit=6, prefetches=[Prefetch(limit=40, query=Fusion.Rrf(k=60), prefetches=[
+                    Prefetch(limit=30, query=Query.Nearest(d, using="dense"), filter=NOT_DELETED),
+                    Prefetch(limit=30, query=Query.Nearest(sp, using="bm25"), filter=NOT_DELETED)])],
+                    query=recency_formula(), with_payload=False)
+                t = time.perf_counter()
+                shard.query(req)
+                lat.append((time.perf_counter() - t) * 1000)
+            lat.sort()
+            size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            out = {"memories": n, "load_s": round(load_s, 1), "index_s": round(index_s, 1), "queries": queries,
+                   "p50_ms": round(lat[len(lat) // 2], 2), "p95_ms": round(lat[int(len(lat) * 0.95) - 1], 2),
+                   "disk_mb": round(size / 1048576, 1)}
+            self.log("scale test", f"{n:,} memories in a scratch Qdrant Edge shard: hybrid search p50 "
+                                   f"{out['p50_ms']} ms · p95 {out['p95_ms']} ms (excl. query embedding)")
+            return out
+        finally:
+            shard.close()
+            self._cleanup(path)
+
+    def facets(self, key):
+        """Native Qdrant facet counts across the node's shards (drives the filter chips)."""
+        out = {}
+        with self.lock:
+            for _, _, shard in self._shards():
+                try:
+                    res = shard.facet(FacetRequest(key, limit=20, filter=NOT_DELETED))
+                except Exception:  # shard restored before the index existed
+                    continue
+                for h in res.hits:
+                    out[h.value] = out.get(h.value, 0) + h.count
+        return out
 
     def metrics(self):
         rows = self.db.execute("SELECT ms_total, ms_shards FROM searches ORDER BY id DESC LIMIT 200").fetchall()
@@ -599,7 +956,9 @@ class EdgeDevice:
         shards = [r[1] for r in rows]
         sync = self.meta("last_sync", {}) or {}
         full = {s: self.meta(f"full_bytes_{s}", 0) for s in self.sites}
+        prop = self.meta("propagation_ms", []) or []
         return {
+            "propagation_last_ms": prop[-1] if prop else None, "propagation_p50_ms": pct(prop, 50),
             "searches": len(rows),
             "search_p50_ms": pct(total, 50), "search_p95_ms": pct(total, 95),
             "shard_p50_ms": pct(shards, 50), "shard_p95_ms": pct(shards, 95),

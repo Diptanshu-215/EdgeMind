@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#ffffff" />
+  <title>EdgeMind · Crew</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%233b82f6%22/%3E%3Crect x=%229%22 y=%229%22 width=%2214%22 height=%2214%22 rx=%223%22 fill=%22none%22 stroke=%22white%22 stroke-width=%222.5%22/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/field.css" />
+  <!--EM_BOOT-->
+</head>
+<body class="field">
+  <!-- crew picker (hub /m) -->
+  <section id="picker" class="picker hidden">
+    <div class="pick-head">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div><h1>Choose your crew</h1><p class="muted small">Your phone connects to that crew's node and works without internet.</p></div>
+    </div>
+    <ul class="pick-list" id="crews"></ul>
+    <p class="muted small center"><a href="/">Open the fleet dashboard</a></p>
+  </section>
+
+  <!-- crew app -->
+  <section id="app" class="hidden">
+    <header class="fhead">
+      <div class="fhead-top">
+        <a class="icon-btn back hidden" id="back" href="/m" aria-label="Switch crew"><span data-icon="chevron" class="flip"></span></a>
+        <div class="crew">
+          <h1 id="crew-name">…</h1>
+          <p class="muted small" id="crew-sites"></p>
+        </div>
+        <label class="switch" title="The node's uplink to the cloud">
+          <input type="checkbox" id="uplink" /><span class="track"></span><span>Uplink</span>
+        </label>
+      </div>
+      <div class="fstatus"><span class="pill" id="conn">…</span><span class="muted small" id="sync-line"></span></div>
+    </header>
+
+    <main class="fmain">
+      <div class="fpane" data-pane="ask">
+        <form id="ask-form" class="askbox">
+          <textarea id="q" rows="2" maxlength="400" placeholder="Ask in English, हिंदी or मराठी"></textarea>
+          <button class="btn primary">Ask</button>
+        </form>
+        <div class="chips" id="samples">
+          <button type="button" class="chip-btn">What must I do before working on a line?</button>
+          <button type="button" class="chip-btn">Transformer drain valve leaking and no spare valve</button>
+          <button type="button" class="chip-btn">Bushing terminal torque?</button>
+          <button type="button" class="chip-btn">Feeder keeps tripping when it rains</button>
+          <button type="button" class="chip-btn">लाइन पर काम शुरू करने से पहले क्या करना चाहिए?</button>
+          <button type="button" class="chip-btn">ट्रान्सफॉर्मर गरम होत आहे आणि आवाज येतो</button>
+        </div>
+        <div class="answer hidden" id="answer"></div>
+      </div>
+
+      <div class="fpane hidden" data-pane="memory">
+        <div class="findrow">
+          <input id="find" type="search" placeholder="Search memories" maxlength="400" />
+          <label class="icon-btn" title="Search by photo">
+            <span data-icon="camera"></span>
+            <input type="file" id="find-photo" accept="image/*" capture="environment" hidden />
+          </label>
+        </div>
+        <div class="filters" id="kind-chips"></div>
+        <p class="muted small" id="find-meta"></p>
+        <ul class="list" id="mem"></ul>
+      </div>
+
+      <div class="fpane hidden" data-pane="add">
+        <form id="add-form" class="add-form">
+          <input type="hidden" id="f-id" />
+          <input id="f-title" placeholder="Title" maxlength="160" />
+          <textarea id="f-text" rows="5" maxlength="4000" placeholder="What did you find or fix? Saved on the node right away, even with no signal."></textarea>
+          <div class="photo-row">
+            <label class="btn"><span data-icon="camera"></span>Add photo
+              <input type="file" id="f-photo" accept="image/*" capture="environment" hidden />
+            </label>
+            <img id="f-photo-preview" class="thumb hidden" alt="photo preview" />
+            <button type="button" class="btn ghost small hidden" id="f-photo-clear">Remove</button>
+          </div>
+          <div class="seg" id="f-kind"></div>
+          <div class="form-row two">
+            <label>Site <select id="f-site"></select></label>
+            <label>Sharing
+              <select id="f-vis">
+                <option value="auto">Automatic</option>
+                <option value="shared">Share with fleet</option>
+                <option value="private">Keep private</option>
+              </select>
+            </label>
+          </div>
+          <div class="policy-preview" id="policy"></div>
+          <div class="form-actions"><button class="btn primary grow" id="save">Save</button>
+            <button type="button" class="btn hidden" id="cancel-edit">Cancel</button></div>
+        </form>
+      </div>
+
+      <div class="fpane hidden" data-pane="review"><div class="review" id="review"></div></div>
+
+      <div class="fpane hidden" data-pane="activity">
+        <ul class="log dev-log" id="feed"></ul>
+      </div>
+    </main>
+
+    <nav class="fnav">
+      <button data-tab="ask" class="active"><span data-icon="message"></span><span>Ask</span></button>
+      <button data-tab="memory"><span data-icon="folder"></span><span>Memory</span></button>
+      <button data-tab="add"><span data-icon="plus"></span><span>Add</span></button>
+      <button data-tab="review"><span data-icon="checkList"></span><span>Review</span><i class="badge" id="rv-badge"></i></button>
+      <button data-tab="activity"><span data-icon="activity"></span><span>Activity</span></button>
+    </nav>
+  </section>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/common.js"></script>
+  <script src="/static/field.js"></script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+/* Crew field app: phone first, large touch targets, same tokens as the dashboard. */
+body.field { min-height: 100vh; font-size: 15px; background: var(--bg); }
+.center { text-align: center; }
+.flip .ico { transform: rotate(180deg); }
+
+/* crew picker */
+.picker { max-width: 520px; margin: 0 auto; padding: 32px 16px; display: grid; gap: 20px; }
+.pick-head { display: flex; gap: 12px; align-items: center; }
+.pick-head h1 { font-size: 19px; }
+.pick-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.crew-card { display: flex; gap: 12px; align-items: center; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
+.crew-card:hover { border-color: var(--border-strong); }
+.crew-card .cc-dot { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; }
+.crew-card .cc-text { flex: 1; min-width: 0; }
+.crew-card b { display: block; font-weight: 600; }
+.crew-card .muted { font-size: 12.5px; }
+.crew-card .go { color: var(--text-3); }
+
+/* header */
+.fhead { position: sticky; top: 0; z-index: 5; background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: max(12px, env(safe-area-inset-top)) 16px 12px; }
+.fhead-top { display: flex; align-items: center; gap: 10px; }
+.crew { flex: 1; min-width: 0; }
+.crew h1 { font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 8px; }
+.crew h1::before { content: ""; width: 10px; height: 10px; border-radius: 3px; background: var(--dev, var(--primary)); flex: none; }
+.crew p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fstatus { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+body.field.offline .fhead { background: #fffdf7; }
+
+/* content */
+.fmain { padding: 16px 16px calc(88px + env(safe-area-inset-bottom)); max-width: 720px; margin: 0 auto; }
+.fpane { display: grid; gap: 14px; }
+.askbox { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: stretch; }
+.askbox textarea { resize: none; border-radius: var(--radius); }
+.askbox .btn { border-radius: var(--radius); padding: 0 20px; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip-btn { font: inherit; font-size: 13px; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface);
+  color: var(--text-2); cursor: pointer; text-align: left; }
+.chip-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.fmain input, .fmain textarea, .fmain select { font-size: 16px; }  /* no iOS zoom on focus */
+.findrow { display: flex; gap: 8px; align-items: center; }
+.findrow input { flex: 1; border-radius: 999px; padding-left: 14px; }
+.findrow .icon-btn { width: 42px; height: 42px; flex: none; }
+.seg { display: flex; gap: 6px; flex-wrap: wrap; }
+.seg button { font: inherit; font-size: 13px; font-weight: 500; padding: 7px 13px; border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text-2); cursor: pointer; text-transform: capitalize; }
+.seg button.active { background: var(--primary-soft); border-color: #cfe0ff; color: var(--primary-600); }
+.form-row.two { grid-template-columns: 1fr 1fr; }
+.btn.grow { flex: 1; }
+.photo-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.photo-row .thumb { width: 56px; height: 56px; }
+.fmain .item-text { font-size: 14px; }
+.fmain .log li { grid-template-columns: 52px 1fr; }
+
+/* bottom navigation */
+.fnav { position: fixed; bottom: 0; left: 0; right: 0; z-index: 6; display: grid; grid-template-columns: repeat(5, 1fr);
+  background: var(--surface); border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom); }
+.fnav button { font: inherit; font-size: 11.5px; font-weight: 500; background: none; border: 0; color: var(--text-3); padding: 9px 0 10px;
+  display: grid; justify-items: center; gap: 3px; cursor: pointer; position: relative; }
+.fnav button .ico { width: 21px; height: 21px; }
+.fnav button.active { color: var(--primary-600); }
+.fnav .badge { position: absolute; top: 5px; left: calc(50% + 8px); font-style: normal; }
+.field .toast { bottom: calc(80px + env(safe-area-inset-bottom)); }
+@media (min-width: 760px) { .fnav { max-width: 720px; margin: 0 auto; border: 1px solid var(--border); border-bottom: 0; border-radius: 14px 14px 0 0; } }
+.field .fchip { text-transform: capitalize; }

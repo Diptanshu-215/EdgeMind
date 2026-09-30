@@ -10,7 +10,7 @@ if not exist .venv (
 ) else (
   call .venv\Scripts\activate
 )
-python launch.py
+python launch.py %*
 goto :eof
 
 :nopython

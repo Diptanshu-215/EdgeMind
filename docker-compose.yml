@@ -1,8 +1,114 @@
+# EdgeMind on Docker: the cloud tier, the hub and two edge nodes.
+#
+#   copy .env.example .env      (set HOST_IP to this machine's Wi-Fi IP so phones can join)
+#   docker compose up -d --build
+#   open http://localhost:8000          phones: http://<HOST_IP>:8000/m
+#
+# Networks mirror the field:
+#   cloud : gateway <-> Qdrant <-> the nodes' uplinks
+#   lan   : the hub (dashboard + phones' field app) <-> the nodes
+# So `docker network disconnect edgemind_cloud edgemind-node-a-1` is a REAL uplink loss:
+# crew A keeps answering its phones through the hub while it has no cloud.
+name: edgemind
+
+x-app: &app
+  build: .
+  image: edgemind:latest
+  restart: unless-stopped
+  extra_hosts: ["host.docker.internal:host-gateway"]
+
+x-secrets: &secrets
+  EDGEMIND_JOIN_CODE: ${JOIN_CODE:-EM-2026}
+  EDGEMIND_ADMIN_TOKEN: ${ADMIN_TOKEN:-change-this-admin-token}
+
+x-node-health: &node-health
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/state', timeout=5)"]
+  interval: 10s
+  timeout: 8s
+  retries: 30
+  start_period: 60s
+
 services:
   qdrant:
     image: qdrant/qdrant:v1.19.1
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+    volumes: [qdrant:/qdrant/storage]
+    networks: [cloud]            # not published: only the gateway can reach it
+
+  gateway:
+    <<: *app
+    command: ["uvicorn", "app.gateway:app", "--host", "0.0.0.0", "--port", "8100"]
+    environment:
+      <<: *secrets
+      QDRANT_URL: http://qdrant:6333
+    volumes: [gateway:/data]
+    ports: ["${GATEWAY_PORT:-8100}:8100"]   # other laptops join here as edge nodes
+    depends_on: [qdrant]
+    networks: [cloud]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health', timeout=5)"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 15s
+
+  hub:
+    <<: *app
+    command: ["python", "launch.py", "--no-browser"]
+    environment:
+      <<: *secrets
+      EDGEMIND_HUB_MODE: external
+      GATEWAY_URL: http://gateway:8100
+      EDGEMIND_PIN: ${OPERATOR_PIN:-246810}
+      EDGEMIND_PUBLIC_HOST: ${HOST_IP:-localhost}
+      EDGEMIND_PUBLIC_GATEWAY: http://${HOST_IP:-localhost}:${GATEWAY_PORT:-8100}
+      CONSOLE_PORT: "8000"
+      EDGEMIND_PUBLIC_PORT: ${HUB_PORT:-8000}
+    volumes: [hub:/data]
+    ports: ["${HUB_PORT:-8000}:8000"]   # dashboard + crew phones
+    depends_on:
+      gateway: {condition: service_healthy}
+    networks: [cloud, lan]
+
+  node-a:
+    <<: *app
+    command: ["python", "launch.py", "join", "--hub", "http://gateway:8100", "--code", "${JOIN_CODE:-EM-2026}",
+              "--id", "tablet-A", "--name", "Line crew A · Pune circle", "--sites", "pune,global",
+              "--port", "8001", "--data", "/data", "--demo-notes"]
+    environment:
+      EDGEMIND_PUBLIC_URL: http://node-a.lan:8001   # lan-only name: phones reach it even with the uplink cut
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    volumes: [node-a:/data]
+    depends_on:
+      gateway: {condition: service_healthy}
+    healthcheck: *node-health
+    networks:
+      cloud: {}
+      lan: {aliases: [node-a.lan]}
+
+  node-b:
+    <<: *app
+    command: ["python", "launch.py", "join", "--hub", "http://gateway:8100", "--code", "${JOIN_CODE:-EM-2026}",
+              "--id", "tablet-B", "--name", "Line crew B · Nagpur circle", "--sites", "nagpur,global",
+              "--port", "8001", "--data", "/data", "--demo-notes"]
+    environment:
+      EDGEMIND_PUBLIC_URL: http://node-b.lan:8001   # lan-only name: phones reach it even with the uplink cut
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+    volumes: [node-b:/data]
+    depends_on:
+      gateway: {condition: service_healthy}
+    healthcheck: *node-health
+    networks:
+      cloud: {}
+      lan: {aliases: [node-b.lan]}
+
+networks:
+  cloud:
+  lan:
+
+volumes:
+  qdrant:
+  gateway:
+  hub:
+  node-a:
+  node-b:

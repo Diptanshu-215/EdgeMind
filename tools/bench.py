@@ -5,12 +5,14 @@
 Needs a running Qdrant Server. Uses the same embedder as the app (EDGEMIND_EMBEDDER).
 """
 import argparse
+import json
 import random
 import shutil
 import sys
 import tempfile
 import time
 import uuid
+import zlib
 from pathlib import Path
 
 import httpx
@@ -49,7 +51,7 @@ def main():
     ap.add_argument("--new", type=int, default=20)
     ap.add_argument("--queries", type=int, default=300)
     ap.add_argument("--index-kb", type=int, default=500)
-    ap.add_argument("--segments", type=int, default=8)
+    ap.add_argument("--segments", type=int, default=2)
     a = ap.parse_args()
     random.seed(7)
     emb = embeddings.get()
@@ -61,7 +63,19 @@ def main():
     c.create_collection(col, vectors_config={"dense": m.VectorParams(size=384, distance=m.Distance.COSINE)},
                         sparse_vectors_config={"bm25": m.SparseVectorParams(modifier=m.Modifier.IDF)}, shard_number=1,
                         optimizers_config=m.OptimizersConfigDiff(indexing_threshold=a.index_kb,
-                                                                 default_segment_number=a.segments))
+                                                                 default_segment_number=a.segments),
+                        wal_config=m.WalConfigDiff(wal_capacity_mb=1))
+
+    def fetch(method, path, **kw):
+        """Like the gateway: Qdrant's gzip stream + one outer gzip. Returns (raw bytes, wire size)."""
+        gz, wire, inner = zlib.compressobj(6, zlib.DEFLATED, 31), 0, b""
+        with http.stream(method, path, headers={"Accept-Encoding": "gzip"}, **kw) as r:
+            for chunk in r.iter_raw():
+                inner += chunk
+                wire += len(gz.compress(chunk))
+        wire += len(gz.flush())
+        raw = zlib.decompress(inner, 31) if inner[:2] == b"" else inner
+        return raw, wire
 
     def points(k0, k1):
         pts = []
@@ -85,7 +99,7 @@ def main():
         time.sleep(1)
 
     work = Path(tempfile.mkdtemp(prefix="em-bench-"))
-    full = http.get(f"/collections/{col}/shards/0/snapshot").content
+    full, full_wire = fetch("GET", f"/collections/{col}/shards/0/snapshot")
     (work / "full.snapshot").write_bytes(full)
     EdgeShard.unpack_snapshot(str(work / "full.snapshot"), str(work / "mirror"))
     shard = EdgeShard.load(str(work / "mirror"))
@@ -102,7 +116,7 @@ def main():
 
     c.upsert(col, points(a.n, a.n + a.new), wait=True)
     time.sleep(2)
-    part = http.post(f"/collections/{col}/shards/0/snapshot/partial/create", json=shard.snapshot_manifest()).content
+    part, part_wire = fetch("POST", f"/collections/{col}/shards/0/snapshot/partial/create", json=shard.snapshot_manifest())
     (work / "part.snapshot").write_bytes(part)
     (work / "tmp").mkdir()
     t = time.perf_counter()
@@ -112,9 +126,12 @@ def main():
     print("\n| Measure | Value |\n| --- | --- |")
     print(f"| Memories on device | {a.n:,} |")
     print(f"| Hybrid search p50 / p95 (on device, excl. embedding) | {pct(lat, 50):.2f} ms / {pct(lat, 95):.2f} ms |")
-    print(f"| Full snapshot (first sync) | {len(full) / 1024 / 1024:.2f} MB |")
-    print(f"| Partial snapshot after {a.new} new memories | {len(part) / 1024:.0f} KB |")
-    print(f"| Partial vs full | {100 * len(part) / len(full):.1f}% of the bytes |")
+    print(f"| Full snapshot (first sync): shard bytes / on the wire | {len(full) / 1048576:.1f} MB / {full_wire / 1024:.0f} KB |")
+    print(f"| Partial snapshot after {a.new} new memories: shard bytes / on the wire | {len(part) / 1048576:.1f} MB / {part_wire / 1024:.0f} KB |")
+    delta = len(json.dumps([{"payload": p.payload, "dense": p.vector["dense"]} for p in
+                            c.scroll(col, scroll_filter=m.Filter(must=[m.FieldCondition(key="seq", range=m.Range(gte=a.n))]),
+                                     with_payload=True, with_vectors=["dense"], limit=a.new)[0]]))
+    print(f"| Point delta for the same {a.new} memories (JSON) | {delta / 1024:.0f} KB |")
     print(f"| Apply partial snapshot on device | {apply_ms:.0f} ms |")
     shard.close()
     shutil.rmtree(work, ignore_errors=True)

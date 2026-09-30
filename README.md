@@ -183,6 +183,77 @@ Nodes detect it and stream an AI answer under the instant one. Without it, every
 instant extracted ones. The first run also downloads the multilingual text model and the CLIP photo models
 (~700 MB in total, once).
 
+## Deploy with Docker
+
+One image for every role; `docker-compose.yml` runs the cloud tier, the hub and two edge nodes, each node
+with its own volume (its own Qdrant Edge shards). The AI models are baked into the image, so a node works
+with no internet from its first boot.
+
+```powershell
+copy .env.example .env        # set HOST_IP to this machine's Wi-Fi IP (ipconfig -> IPv4 Address)
+docker compose up -d --build  # first build ~5 min (downloads ~700 MB of models), image ~2 GB
+```
+
+Open `http://localhost:8000` (or `HUB_PORT` from `.env`); phones use `http://<HOST_IP>:8000/m`.
+The operator PIN is `OPERATOR_PIN` in `.env`. AI answers use Ollama on the host (`host.docker.internal:11434`).
+
+| Service | Role | Published |
+|---|---|---|
+| `qdrant` | Qdrant Server 1.19.1 | not published (only the gateway reaches it) |
+| `gateway` | sync gateway | `GATEWAY_PORT` (8100): other laptops join here |
+| `hub` | dashboard + phone app + live aggregator (`EDGEMIND_HUB_MODE=external`) | `HUB_PORT` (8000) |
+| `node-a`, `node-b` | edge nodes (`launch.py join`) | not published (phones go through the hub) |
+
+Two networks mirror the field: `cloud` (gateway ⇄ Qdrant ⇄ node uplinks) and `lan` (hub ⇄ nodes). That makes
+a **real** uplink cut a one-liner: the node keeps serving its crew through the hub while it has no cloud.
+
+```powershell
+docker network disconnect edgemind_cloud edgemind-node-a-1   # crew A loses its uplink (writes queue)
+docker network connect    edgemind_cloud edgemind-node-a-1   # uplink back: queue drains in seconds
+docker compose stop gateway qdrant                           # the whole cloud goes down
+docker compose start qdrant gateway
+docker compose logs -f hub                                   # hub banner, phone QR code
+docker compose down                                          # stop (add -v to also delete all data)
+```
+
+More nodes: copy a `node-*` service with a new id, name, sites and volume, or run `launch.py join` on any
+laptop against `http://<HOST_IP>:<GATEWAY_PORT>`.
+
+## Public URL (judges on mobile data, no shared Wi-Fi)
+
+A Cloudflare quick tunnel publishes the running hub at a public `https://….trycloudflare.com` address:
+
+```powershell
+winget install Cloudflare.cloudflared                              # once
+powershell -ExecutionPolicy Bypass -File tools\public-url.ps1     # prints the public URL; Ctrl+C stops it
+```
+
+Open the printed URL on the projector: the **📱 Join** QR code then points phones at the public URL, so they can
+join over mobile data. Notes:
+- The script uses HTTP/2 over TCP 443 (`--protocol http2`), which works on networks that block QUIC/UDP.
+- In that mode the tunnel buffers streaming responses, so pages automatically fall back to 2-second polling
+  (the chip shows **● live (2 s)**). On the LAN they stay on instant server-push.
+- Tunnel the **Docker** deployment: admin actions over the public URL need `OPERATOR_PIN`. Don't tunnel the
+  `run.bat` hub as-is (set `EDGEMIND_TRUST_LOCALHOST=0` first), because tunnelled requests look local to it.
+- The quick-tunnel URL changes every time it starts, and it only works while this laptop is on and online.
+  A free Cloudflare account gives a fixed hostname (`cloudflared tunnel create …`).
+
+### Crews on other networks (store and forward)
+
+Nodes save everything locally and forward it whenever they can reach the gateway. To let a node on a
+*different* network (another town, a laptop on mobile data) reach a gateway running on this laptop, publish
+the gateway too:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\public-url.ps1 -Port 8110          # prints https://<gw>.trycloudflare.com
+.\run.bat join --hub https://<gw>.trycloudflare.com --code <JOIN_CODE> --name "Line crew C" --sites nagpur,global
+```
+
+Measured through a tunnel: a crew on another network bootstraps in ~18 s; crew A -> crew C ~3.6 s,
+crew C -> crew B ~1 s; C's writes made with no internet reach B ~1 s after C reconnects. Behind a tunnel the
+node detects that server push is buffered and syncs every 3 s. For a permanent setup, run the cloud tier
+(`qdrant`, `gateway`, `hub`) on a cloud server and point every van's node at it.
+
 ## Security model
 
 | Threat | Control |
@@ -199,13 +270,51 @@ not encrypted at rest; the join code is shared by the fleet.
 
 ## Tests
 
+A feature-by-feature suite (pytest). Every feature is its own file and can run alone; one command runs them all.
+System tests start their **own isolated stack** (Qdrant Server + gateway + tablet-A + tablet-B + hub) in a temp
+folder on free ports, so your `data/` folder and a running hub are never touched.
+
+```powershell
+.\test.bat                       # everything (~10-15 min, mostly real processes)
+.\test.bat --list                # the features
+.\test.bat offline               # one feature
+.\test.bat sync conflicts        # several
+.\test.bat --fast                # component tests only: no servers, ~30 s
+.\test.bat conflicts -k merge    # extra arguments go to pytest
+.\test.bat --keep ...            # keep the stack's folder (logs, shards) even when everything passes
+```
+(`python tests/run_tests.py ...` does the same on any OS; `python -m pip install -r requirements-dev.txt` once.)
+
+| Feature | What it proves (PS03) |
+|---|---|
+| `edge_memory` | memory on the device: write, edit (versioned + re-indexed), delete/tombstone, history, survives restart |
+| `hybrid_search` | dense / BM25 / hybrid with per-result "why", filters, latency, misses, Hindi/Marathi, scale test, offline |
+| `sync_policy` | what stays local / syncs / syncs redacted, credentials never leave, priority, retract when made private |
+| `sync` | enrollment, full-snapshot bootstrap, site subscriptions, live push, dual-write purge, edit + delete propagation, partial-snapshot reconcile |
+| `offline` | uplink off, priority-ordered outbox, **real cloud kill** → queue → drains by itself, both nodes offline |
+| `conflicts` | concurrent edits → merge / keep mine / take theirs, edit beats delete, readings newest-wins, duplicates linked |
+| `contradictions` | 50 Nm vs 40 Nm flagged offline on write and on arrival from another crew, dismiss |
+| `fleet_demand` | failed search → fleet demand → another crew's note suggested → shared → received live; private stays private |
+| `answers` | offline cited answers, honest "don't know", another crew's knowledge used offline, local LLM (if installed) |
+| `photos` | CLIP on the node, text→photo and photo→photo across the fleet, full photo stays local (if models present) |
+| `security` | join code, tokens, site ACL, admin-only reads, revocation, operator PIN, validation, Qdrant on loopback |
+| `dashboard_ui` | pages + assets served, JS parses, fleet/state/activity APIs, live SSE streams, QR code |
+| `elastic_fleet` | add a node from the hub → bootstrap → live exchange → remove → token revoked, shards deleted |
+| `remote_node_and_reset` | separate `launch.py join` process joins over HTTP, works offline; hub reset → it re-publishes (runs last) |
+
+**When something fails** the report shows the failing assertion with the values involved, the flow steps
+that passed and the one that failed, each touched node's sync status and recent activity log, the tail of the
+gateway/node process logs, and the path of the kept stack folder. A summary table per feature is printed at the end.
+
+The original single-script story test and the benchmark are still there:
+
 ```bash
 python tests/test_e2e.py                          # real processes + real Qdrant Server (~5 min)
 EDGEMIND_QDRANT=embedded python tests/test_e2e.py # no server (point sync)
 python tools/bench.py --n 20000                   # needs a running Qdrant Server
 ```
 
-The end-to-end test drives everything over HTTP through the hub, like the phones do:
+The story test drives everything over HTTP through the hub, like the phones do:
 1. enrollment, subscriptions, redaction
 2. **security** (admin-only reads, site isolation, wrong join code)
 3. offline write + search, reconnect
@@ -238,8 +347,9 @@ app/facts.py         conflicting-value detection
 app/answer.py        offline answers: Ollama, or semantic sentence extraction with citations
 app/seed.py          demo data: DISCOM line crews, Pune and Nagpur circles
 static/              dashboard (index.html, app.js) and phone field app (field.html, field.js); no build step
-tests/test_e2e.py    end-to-end system test
+tests/               feature-by-feature test suite (run_tests.py, test_NN_<feature>.py) + test_e2e.py story test
 tools/bench.py       benchmark
 ```
-#   E d g e M i n d  
+#   E d g e M i n d 
+ 
  

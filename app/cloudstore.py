@@ -6,12 +6,19 @@ Embedded mode: qdrant-client local mode; no snapshots, devices use point sync.
 """
 import threading
 import warnings
+import zlib
 
 import httpx
 from qdrant_client import QdrantClient
 from qdrant_client import models as m
 
 from . import config, embeddings
+
+def _chain(first, rest):
+    if first:
+        yield first
+    yield from rest
+
 
 NOT_DELETED = m.Filter(must_not=[m.FieldCondition(key="deleted", match=m.MatchValue(value=True))])
 
@@ -48,19 +55,26 @@ class CloudStore:
                 return
             # Tuned for edge sync (see tools/bench.py): bulk data is indexed into sealed
             # segments, new writes land in a small appendable one, so a partial snapshot
-            # after a few changes is ~1% of the full shard instead of ~50%.
+            # after a few changes carries one small segment, not the whole shard.
+            # Few segments + a 1 MB WAL: every appendable segment preallocates ~32 MB pages,
+            # which on Windows (no sparse files) end up in the snapshot tar as zeros.
             extra = {"shard_number": 1,
-                     "optimizers_config": m.OptimizersConfigDiff(indexing_threshold=500, default_segment_number=8)
+                     "optimizers_config": m.OptimizersConfigDiff(indexing_threshold=500, default_segment_number=2),
+                     "wal_config": m.WalConfigDiff(wal_capacity_mb=1),
                      } if self.server else {}
             self.client.create_collection(
                 col,
-                vectors_config={"dense": m.VectorParams(size=config.DENSE_DIM, distance=m.Distance.COSINE)},
+                vectors_config={"dense": m.VectorParams(size=config.DENSE_DIM, distance=m.Distance.COSINE),
+                                "image": m.VectorParams(size=config.IMAGE_DIM, distance=m.Distance.COSINE)},
                 sparse_vectors_config={"bm25": m.SparseVectorParams(modifier=m.Modifier.IDF)},
                 **extra,
             )
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                for field, schema in (("seq", m.PayloadSchemaType.INTEGER), ("deleted", m.PayloadSchemaType.BOOL)):
+                for field, schema in (("seq", m.PayloadSchemaType.INTEGER), ("deleted", m.PayloadSchemaType.BOOL),
+                                      ("kind", m.PayloadSchemaType.KEYWORD), ("site", m.PayloadSchemaType.KEYWORD),
+                                      ("updated_at", m.PayloadSchemaType.FLOAT), ("status", m.PayloadSchemaType.KEYWORD),
+                                      ("photo", m.PayloadSchemaType.KEYWORD)):
                     try:
                         self.client.create_payload_index(col, field, field_schema=schema)
                     except Exception:
@@ -85,10 +99,10 @@ class CloudStore:
     # ---------------------------------------------------------------- reads
     def get(self, site, doc_id):
         with self.lock:
-            pts = self.client.retrieve(config.collection(site), [doc_id], with_payload=True, with_vectors=["dense"])
+            pts = self.client.retrieve(config.collection(site), [doc_id], with_payload=True, with_vectors=["dense", "image"])
         if not pts:
             return None
-        return {"payload": pts[0].payload, "dense": pts[0].vector["dense"]}
+        return {"payload": pts[0].payload, "dense": pts[0].vector["dense"], "image": pts[0].vector.get("image")}
 
     def changes_since(self, site, since_seq, limit=500):
         flt = m.Filter(must=[m.FieldCondition(key="seq", range=m.Range(gt=since_seq))])
@@ -96,8 +110,9 @@ class CloudStore:
         with self.lock:
             while True:
                 pts, offset = self.client.scroll(config.collection(site), scroll_filter=flt, with_payload=True,
-                                                 with_vectors=["dense"], limit=256, offset=offset)
-                out.extend({"payload": p.payload, "dense": p.vector["dense"]} for p in pts)
+                                                 with_vectors=["dense", "image"], limit=256, offset=offset)
+                out.extend({"payload": p.payload, "dense": p.vector["dense"], "image": p.vector.get("image")}
+                           for p in pts)
                 if offset is None or len(out) >= limit:
                     break
         out.sort(key=lambda d: d["payload"]["seq"])
@@ -131,12 +146,12 @@ class CloudStore:
         hits.sort(key=lambda h: h["score"], reverse=True)
         return hits[:limit]
 
-    def find_similar(self, dense, exclude_id, threshold):
+    def find_similar(self, dense, exclude_id, threshold, sites=None):
         flt = m.Filter(must_not=[m.HasIdCondition(has_id=[exclude_id]),
                                  m.FieldCondition(key="deleted", match=m.MatchValue(value=True))])
         best = None
         with self.lock:
-            for site in config.SITES:
+            for site in sites or config.SITES:
                 res = self.client.query_points(config.collection(site), query=dense, using="dense", limit=1,
                                                query_filter=flt, with_payload=True).points
                 if res and res[0].score >= threshold and (best is None or res[0].score > best["score"]):
@@ -145,20 +160,55 @@ class CloudStore:
         return best
 
     # ---------------------------------------------------------------- writes
-    def upsert(self, site, doc_id, dense, text, payload):
+    def upsert(self, site, doc_id, dense, text, payload, image=None):
         vec = {"dense": dense}
+        if image:
+            vec["image"] = image
         if text:
             vec["bm25"] = sparse(embeddings.get().sparse_doc(text))
         with self.lock:
             self.client.upsert(config.collection(site), [m.PointStruct(id=doc_id, vector=vec, payload=payload)], wait=True)
 
     # ---------------------------------------------------------------- snapshots (server mode)
-    def full_snapshot(self, site) -> bytes:
-        r = self.http.get(f"/collections/{config.collection(site)}/shards/0/snapshot")
-        r.raise_for_status()
-        return r.content
+    def open_snapshot(self, site, manifest=None):
+        """Open a shard snapshot stream (full, or partial against a device manifest).
+        Returns (response, layers): Qdrant gzips it when asked, which is passed through as-is."""
+        path = f"/collections/{config.collection(site)}/shards/0/snapshot"
+        req = self.http.build_request("POST", path + "/partial/create", json=manifest) if manifest is not None \
+            else self.http.build_request("GET", path)
+        req.headers["Accept-Encoding"] = "gzip"
+        req.headers["Connection"] = "close"  # never reuse a connection a large stream may have left dirty
+        r = self.http.send(req, stream=True)
+        if r.status_code >= 400:
+            r.read()
+            r.close()
+            r.raise_for_status()
+        return r, (1 if r.headers.get("content-encoding") == "gzip" else 0)
 
-    def partial_snapshot(self, site, manifest) -> bytes:
-        r = self.http.post(f"/collections/{config.collection(site)}/shards/0/snapshot/partial/create", json=manifest)
-        r.raise_for_status()
-        return r.content
+    @staticmethod
+    def first_chunk(resp):
+        """Qdrant answers a partial snapshot with an EMPTY body when the device already has every
+        segment. Peek so the gateway can say 204 'nothing changed' instead of streaming nothing."""
+        it = resp.iter_raw(1 << 20)
+        return next(it, b""), it
+
+    @staticmethod
+    def wrap(resp, stats, first=b"", rest=None):
+        """Snapshot tars are mostly preallocated zero pages (32 MB per appendable segment file).
+        Qdrant's own gzip leaves long repetitive runs, so one more gzip pass over its (small)
+        output shrinks the wire size another ~25x for almost no CPU. Nothing is buffered."""
+        gz = zlib.compressobj(6, zlib.DEFLATED, 31)
+        stats.update(inner=0, wire=0)
+        try:
+            chunks = resp.iter_raw(1 << 20) if rest is None else _chain(first, rest)
+            for chunk in chunks:
+                stats["inner"] += len(chunk)
+                out = gz.compress(chunk)
+                if out:
+                    stats["wire"] += len(out)
+                    yield out
+            out = gz.flush()
+            stats["wire"] += len(out)
+            yield out
+        finally:
+            resp.close()
